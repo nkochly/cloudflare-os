@@ -3,6 +3,7 @@
 
 import { expect, it, vi } from "vitest";
 import type { DriveNodePage } from "../src/configurator/drive-configurator-types";
+import { nodes, text } from "./configurator-tree";
 
 vi.mock("@gadgets/configurator-ui", () => ({
   h: (component: unknown, props: unknown, ...children: unknown[]) => ({
@@ -15,20 +16,6 @@ vi.mock("@gadgets/configurator-ui", () => ({
   Notice: "Notice",
   Section: "Section",
 }));
-
-type Node = { component: unknown; props: Record<string, any>; children: unknown[] };
-
-const nodes = (tree: unknown): Node[] => {
-  if (Array.isArray(tree)) return tree.flatMap(nodes);
-  if (!tree || typeof tree !== "object" || !("component" in tree)) return [];
-  return [tree as Node, ...nodes((tree as Node).children)];
-};
-
-const text = (tree: unknown): string =>
-  typeof tree === "string" ? tree
-  : Array.isArray(tree) ? tree.map(text).join("")
-  : tree && typeof tree === "object" && "children" in tree ? text((tree as Node).children)
-  : "";
 
 const GRANT = "https://drive.google.com/drive/shared-drives";
 

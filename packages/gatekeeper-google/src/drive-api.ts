@@ -147,11 +147,9 @@ type InternalDriveQuery = {
 
 /** Structured Drive search clauses. Every populated field is AND-ed. */
 export type DriveFileQuery = {
-  /** Single-type shorthand retained for configurator lookups. */
+  /** Single-type shorthand. */
   mimeType?: string;
   mimeTypes?: string[];
-  /** Internal configurator filter; not exposed to agents. */
-  excludeMimeTypes?: string[];
   /** Name prefix; Drive spells its prefix-only operator `contains`. */
   namePrefix?: string;
   fullTextContains?: string;
@@ -445,6 +443,18 @@ export function isInsufficientScope(error: unknown): boolean {
     error.reason === "insufficientPermissions";
 }
 
+/**
+ * Drive's indistinguishable "absent or not permitted" answer about one file.
+ *
+ * One definition, because the session cores, the batch path and the configurator must agree on it:
+ * a reason Google documents as account-wide is an outage, not a scope fact, and recording it would
+ * narrow a listing or deny a binding for everyone.
+ */
+export function isFileInvisible(error: unknown): boolean {
+  return error instanceof DriveApiRequestError && !error.isAccountWide &&
+    (error.status === 403 || error.status === 404);
+}
+
 const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded"]);
 
 /**
@@ -522,9 +532,6 @@ export function buildDriveQuery(query: DriveFileQuery, internal: InternalDriveQu
   let mimeTypes = query.mimeTypes?.map(value => value.trim()).filter(Boolean);
   if (mimeTypes?.length) {
     clauses.push(`(${mimeTypes.map(value => literalClause("mimeType", "=", value)).join(" or ")})`);
-  }
-  for (let mimeType of query.excludeMimeTypes ?? []) {
-    if (mimeType.trim()) clauses.push(literalClause("mimeType", "!=", mimeType.trim()));
   }
   if (query.modifiedAfter) clauses.push(literalClause("modifiedTime", ">", query.modifiedAfter));
   if (query.modifiedBefore) clauses.push(literalClause("modifiedTime", "<", query.modifiedBefore));

@@ -8,7 +8,7 @@ import type { ChatSpaceInfo } from "./chat-types";
 import { GoogleAccessToken } from "./google-api";
 import { AccessTokenProvider, AccessTokenRequest } from "./auth-retry";
 import {
-  DriveApi, DriveApiDisabledError, DriveApiRequestError, FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE,
+  DriveApi, DriveApiDisabledError, FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE, isFileInvisible,
   type DriveFile, type DriveFileList,
 } from "./drive-api";
 import type { BigQueryConfiguratorRpc } from "./configurator/bigquery-configurator-types";
@@ -41,6 +41,7 @@ type ConfiguratorTokenGetter = (opts?: AccessTokenRequest) => Promise<GoogleAcce
 const googleTokenGetters = new WeakMap<object, ConfiguratorTokenGetter>();
 const officeConversions = new WeakMap<object, OfficeConversion>();
 const sharedDrivesGrantChecks = new WeakMap<object, () => Promise<boolean>>();
+const myDriveIds = new WeakMap<object, Promise<string>>();
 const calendarConfiguratorCaches = new WeakMap<object, Promise<ConfiguratorOption[]>>();
 const bigQueryConfiguratorCaches = new WeakMap<object, Map<string, ConfiguratorOption[]>>();
 const BIGQUERY_CONFIGURATOR_CACHE_MAX_ENTRIES = 200;
@@ -139,7 +140,7 @@ function tellApartSameNamed(nodes: DriveNode[]): DriveNode[] {
   for (let key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
   return nodes.map((node, index) => {
     if (counts.get(keys[index])! < 2) return node;
-    let id = node.id.slice(node.id.indexOf(":") + 1);
+    let id = parseDriveNodeId(node.id)?.fileId ?? node.id;
     let tail = id.length > 8 ? `…${id.slice(-8)}` : id;
     return { ...node, detail: node.detail ? `${node.detail} · ${tail}` : tail };
   });
@@ -448,10 +449,22 @@ const MAX_DRIVE_PATH_DEPTH = 20;
 const DRIVE_BROWSE_DISABLED =
   "Browsing Drive requires the Google Drive API to be enabled for this OAuth project.";
 
-/** A file or folder this account cannot see: absent, or refused for this file alone. */
-function isUnseenDriveFile(error: unknown): boolean {
-  return error instanceof DriveApiRequestError &&
-    (error.status === 404 || (error.status === 403 && !error.isAccountWide));
+/** The Drive file a folder or file node names. Groupings and the root name none. */
+function parseDriveNodeId(id: string): { kind: "folder" | "file"; fileId: string } | undefined {
+  let match = /^(folder|file):(.+)$/s.exec(id);
+  return match ? { kind: match[1] as "folder" | "file", fileId: match[2] } : undefined;
+}
+
+/** My Drive's root folder id, which never changes for an account, so a picker reads it once. */
+function myDriveId(target: object, drive: DriveApi): Promise<string> {
+  let id = myDriveIds.get(target);
+  if (!id) {
+    id = drive.getFile("root").then(root => root.id);
+    // Don't let a transient API error poison the cache permanently.
+    id.catch(() => myDriveIds.delete(target));
+    myDriveIds.set(target, id);
+  }
+  return id;
 }
 
 /** The picker's node for a listed file. A shortcut stands for its target, which is what binds. */
@@ -476,14 +489,15 @@ function driveFileNode(file: DriveFile, detail?: string): DriveNode | undefined 
     : { id: `file:${id}`, kind: "file", ...(mimeType ? { mimeType } : {}), ...shown };
 }
 
+function drivePage(nodes: DriveNode[], nextPageToken: string | undefined): DriveNodePage {
+  return { nodes: tellApartSameNamed(nodes), ...(nextPageToken ? { nextCursor: nextPageToken } : {}) };
+}
+
 function driveFilePage(
   { files, nextPageToken }: DriveFileList,
   detail?: (file: DriveFile) => string,
 ): DriveNodePage {
-  return {
-    nodes: tellApartSameNamed(files.flatMap(file => driveFileNode(file, detail?.(file)) ?? [])),
-    ...(nextPageToken ? { nextCursor: nextPageToken } : {}),
-  };
+  return drivePage(files.flatMap(file => driveFileNode(file, detail?.(file)) ?? []), nextPageToken);
 }
 
 /**
@@ -491,7 +505,11 @@ function driveFilePage(
  * (shared from a folder this account cannot see) or the walk is too deep, since a partial path
  * would misstate where the file lives.
  */
-async function drivePath(drive: DriveApi, file: DriveFile): Promise<DriveNodeAncestor[] | undefined> {
+async function drivePath(
+  drive: DriveApi,
+  file: DriveFile,
+  myDriveId: Promise<string>,
+): Promise<DriveNodeAncestor[] | undefined> {
   let ancestors: DriveFile[] = [];
   let top = file;
   for (let parentId = top.parents?.[0]; parentId; parentId = top.parents?.[0]) {
@@ -499,14 +517,14 @@ async function drivePath(drive: DriveApi, file: DriveFile): Promise<DriveNodeAnc
     try {
       top = await drive.getFile(parentId);
     } catch (error) {
-      if (isUnseenDriveFile(error)) return undefined;
+      if (isFileInvisible(error)) return undefined;
       throw error;
     }
     ancestors.unshift(top);
   }
   let folders = ancestors.map(folder => ({ id: `folder:${folder.id}`, title: folder.name }));
-  if (top.driveId !== undefined && top.driveId === top.id) return [SHARED_DRIVES, ...folders];
-  if (top.driveId === undefined && top.id === (await drive.getFile("root")).id) {
+  if (top.driveId === top.id) return [SHARED_DRIVES, ...folders];
+  if (top.driveId === undefined && top.id === await myDriveId) {
     return folders.map((folder, index) => index === 0 ? { ...folder, title: "My Drive" } : folder);
   }
   return undefined;
@@ -567,10 +585,10 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
             : file.owners?.[0]?.displayName ?? file.owners?.[0]?.emailAddress ?? "My Drive");
       }
       if (parentId === DRIVE_ROOT_ID) {
-        let myDrive = await drive.getFile("root");
+        let myDrive = await myDriveId(this, drive);
         return {
           nodes: [
-            { id: `folder:${myDrive.id}`, title: "My Drive", kind: "folder", listable: true },
+            { id: `folder:${myDrive}`, title: "My Drive", kind: "folder", listable: true },
             { ...SHARED_DRIVES, kind: "group" },
             { ...SHARED_WITH_ME, kind: "group" },
           ],
@@ -583,26 +601,23 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
           return { nodes: [], needsGrant: SHARED_DRIVES_GRANT };
         }
         let { drives, nextPageToken } = await drive.listSharedDrives(page);
-        return {
-          nodes: tellApartSameNamed(drives.map(({ id, name }) => ({
-            id: `folder:${id}`, title: name, kind: "sharedDrive",
-          }))),
-          ...(nextPageToken ? { nextCursor: nextPageToken } : {}),
-        };
+        return drivePage(
+          drives.map(({ id, name }) => ({ id: `folder:${id}`, title: name, kind: "sharedDrive" })),
+          nextPageToken);
       }
       if (parentId === SHARED_WITH_ME.id) {
         return driveFilePage(await drive.listFiles({ ...page, sharedWithMe: true, orderBy: "folder,name" }));
       }
-      let folderId = parentId.startsWith("folder:") ? parentId.slice("folder:".length) : "";
-      if (!folderId) throw new Error("Unknown Drive location.");
+      let folder = parseDriveNodeId(parentId);
+      if (folder?.kind !== "folder") throw new Error("Unknown Drive location.");
       return driveFilePage(await drive.listFiles({
-        ...page, directParentIds: [folderId], corpus: { kind: "allDrives" }, orderBy: "folder,name",
+        ...page, directParentIds: [folder.fileId], corpus: { kind: "allDrives" }, orderBy: "folder,name",
       }));
     });
   }
 
   async getDriveNode(id: string): Promise<DriveNode | null> {
-    let fileId = /^(?:folder|file):(.+)$/s.exec(id)?.[1];
+    let fileId = parseDriveNodeId(id)?.fileId;
     if (!fileId) return null;
     let drive = new DriveApi(googleTokenProvider(this));
     return withDriveApiEnabled<DriveNode | null>(DRIVE_BROWSE_DISABLED, async () => {
@@ -610,13 +625,13 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
       try {
         file = await drive.getFile(fileId);
       } catch (error) {
-        if (isUnseenDriveFile(error)) return null;
+        if (isFileInvisible(error)) return null;
         throw error;
       }
       // A folder named as a file, or a shortcut, is not the node the id claims.
       let node = file.trashed ? undefined : driveFileNode(file);
       if (node?.id !== id) return null;
-      let path = await drivePath(drive, file);
+      let path = await drivePath(drive, file, myDriveId(this, drive));
       return path ? { ...node, path } : node;
     });
   }

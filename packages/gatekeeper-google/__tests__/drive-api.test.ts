@@ -131,27 +131,16 @@ describe("buildDriveQuery", () => {
     );
   });
 
-  it("ANDs each excludeMimeTypes clause", () => {
-    expect(buildDriveQuery({
-      excludeMimeTypes: ["application/vnd.google-apps.folder", "text/plain"],
-    })).toBe(
-      "trashed = false and mimeType != 'application/vnd.google-apps.folder' and " +
-      "mimeType != 'text/plain'",
-    );
-  });
-
   it("escapes each newly interpolated search value", () => {
     expect(buildDriveQuery({
       fullTextContains: "Ada's \\note",
       mimeTypes: ["app/x-'a", "app/x-\\b"],
-      excludeMimeTypes: ["app/x-'c"],
       modifiedAfter: "2026-'01",
       modifiedBefore: "2026-\\02",
       directParentIds: ["folder-'1\\"],
     })).toBe(
       "trashed = false and fullText contains 'Ada\\'s \\\\note' and " +
       "(mimeType = 'app/x-\\'a' or mimeType = 'app/x-\\\\b') and " +
-      "mimeType != 'app/x-\\'c' and " +
       "modifiedTime > '2026-\\'01' and " +
       "modifiedTime < '2026-\\\\02' and " +
       "'folder-\\'1\\\\' in parents",

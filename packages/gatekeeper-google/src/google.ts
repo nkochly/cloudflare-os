@@ -101,8 +101,8 @@ import { Mutex } from "./mutex";
 import {
   BIGQUERY_HOST, BIGQUERY_RESOURCE, GMAIL_RESOURCE, GOOGLE_CALENDAR_RESOURCE,
   GOOGLE_CHAT_RESOURCE, GOOGLE_CHAT_SPACE_RESOURCE, GOOGLE_CHAT_THREAD_RESOURCE,
-  GOOGLE_DOC_RESOURCE, GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_FOLDER_RESOURCE,
-  GOOGLE_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE, RESOURCE_BY_KIND,
+  GOOGLE_DOC_RESOURCE, GOOGLE_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE,
+  RESOURCE_BY_KIND,
   SUPPORTED_RESOURCES, creatableKind, nativeFileUrl,
   grantedResourceUrlPatterns, hasDriveResourceGrant, isPrivateGrant, OFFICE_IMPORT_GRANT,
   SHARED_DRIVES_GRANT,
@@ -967,10 +967,11 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       };
     }
 
-    // One picker for the whole account, a folder or a file (see SupportedResource.groupedWith).
+    // One picker for the whole account and every type grouped with it: a folder or a file.
+    let groupedWith = SUPPORTED_RESOURCES
+      .find(resource => resource.urlPattern === resourceUrlPattern)?.groupedWith;
     if (resourceUrlPattern === GOOGLE_DRIVE_RESOURCE.urlPattern ||
-        resourceUrlPattern === GOOGLE_DRIVE_FOLDER_RESOURCE.urlPattern ||
-        resourceUrlPattern === GOOGLE_DRIVE_FILE_RESOURCE.urlPattern) {
+        groupedWith === GOOGLE_DRIVE_RESOURCE.urlPattern) {
       return {
         iframeHtml: DRIVE_CONFIGURATOR_HTML,
         ui: new RpcStub(new DriveConfiguratorUI(getToken, holds(SHARED_DRIVES_GRANT))),

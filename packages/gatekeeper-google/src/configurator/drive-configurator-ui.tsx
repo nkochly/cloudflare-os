@@ -30,7 +30,7 @@ const accepts = (accepted: readonly string[] | undefined, id: string): boolean =
   return pattern !== undefined && (accepted === undefined || accepted.includes(pattern));
 };
 
-const driveId = (id: string) => id.slice(id.indexOf(":") + 1);
+const fileIdOf = (id: string) => id.slice(id.indexOf(":") + 1);
 
 const icon = (d: string) => <svg viewBox="0 0 256 256" fill="currentColor"><path d={d} /></svg>;
 
@@ -133,14 +133,9 @@ export default {
   isReady: ({ values: { target }, acceptedResourceUrlPatterns }) =>
     typeof target === "string" && accepts(acceptedResourceUrlPatterns, target),
   resourceUrl: ({ values: { target } }) => {
-    if (target === ROOT_ID) return ACCOUNT_PATTERN;
-    if (target?.startsWith("folder:")) {
-      return `https://drive.google.com/drive/folders/${encodeURIComponent(driveId(target))}`;
-    }
-    if (target?.startsWith("file:")) {
-      return `https://drive.google.com/file/d/${encodeURIComponent(driveId(target))}/view`;
-    }
-    throw new Error("Choose what to connect.");
+    const pattern = target ? patternOf(target) : undefined;
+    if (!target || !pattern) throw new Error("Choose what to connect.");
+    return pattern.replace(/:\w+Id\b/, () => encodeURIComponent(fileIdOf(target)));
   },
   render(context) {
     const { values: { target = null }, setValues, ui, acceptedResourceUrlPatterns: accepted } = context;
