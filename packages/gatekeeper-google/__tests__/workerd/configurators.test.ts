@@ -173,6 +173,35 @@ describe("Google resource configurators", () => {
       ]);
     });
 
+    // The links Drive's and Docs' Copy link give out, and a browser's address bar, which adds the
+    // signed-in account's index when there are several.
+    it.each([
+      ["a folder's sharing link", "https://drive.google.com/drive/folders/D2?usp=sharing", "folder:D2"],
+      ["a folder from the address bar", "https://drive.google.com/drive/u/1/folders/D2", "folder:D2"],
+      ["a file's sharing link", " https://drive.google.com/file/d/F9/view?usp=drive_link ", "file:F9"],
+      ["a Google Doc's link", "https://docs.google.com/document/d/F9/edit?usp=sharing", "file:F9"],
+      ["a Google Sheet from the address bar", "https://docs.google.com/spreadsheets/u/0/d/F9/edit#gid=0", "file:F9"],
+    ])("finds the node %s names, instead of searching for it by name", async (_, link, id) => {
+      const calls = stubDrive({
+        "/files/D2": { id: "D2", name: "Specs", mimeType: FOLDER, capabilities: { canListChildren: true } },
+        "/files/F9": { id: "F9", name: "Q3", mimeType: "application/vnd.google-apps.document" },
+        "/files/root": { id: "0AMyRoot", name: "My Drive", mimeType: FOLDER },
+      });
+
+      const { nodes } = await picker().listDriveNodes("folder:F1", link, null);
+
+      expect(nodes.map(node => node.id)).toEqual([id]);
+      expect(calls.map(url => url.pathname)).not.toContain("/drive/v3/files");
+    });
+
+    it("finds nothing for a link to a node this account cannot see", async () => {
+      const calls = stubDrive({});
+
+      await expect(picker().listDriveNodes("drive", "https://drive.google.com/file/d/F0/view", null))
+        .resolves.toEqual({ nodes: [] });
+      expect(calls.map(url => url.pathname)).not.toContain("/drive/v3/files");
+    });
+
     it("finds a pre-filled file with the folders it lives in", async () => {
       stubDrive({
         "/files/F9": { id: "F9", name: "Q3.pdf", mimeType: "application/pdf", parents: ["A"] },

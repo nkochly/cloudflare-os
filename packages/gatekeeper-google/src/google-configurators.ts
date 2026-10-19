@@ -30,6 +30,7 @@ import type { ChatThreadConfiguratorRpc } from "./configurator/chat-thread-confi
 import type {
   DriveConfiguratorRpc, DriveNode, DriveNodeAncestor, DriveNodePage,
 } from "./configurator/drive-configurator-types";
+import { parseResourceUrl } from "./resources";
 
 /**
  * Mints an access token for a configurator, forwarding `AccessTokenRequest` to the `UserAccount`
@@ -510,6 +511,31 @@ async function drivePath(drive: DriveApi, file: DriveFile): Promise<DriveNodeAnc
   return undefined;
 }
 
+/**
+ * The picker's id for the folder or file a pasted Drive, Docs, Sheets or Slides link names, read as
+ * a resource URL is once the index a browser signed in to several accounts adds (`/u/1/`) is
+ * dropped. Undefined for anything else, which is searched for by name.
+ */
+function linkedDriveNodeId(text: string): string | undefined {
+  let url = URL.parse(text.trim());
+  if (!url) return undefined;
+  url.pathname = url.pathname.replace(/\/u\/\d+\//, "/");
+  let target;
+  try {
+    target = parseResourceUrl(url.href);
+  } catch {
+    return undefined;
+  }
+  switch (target.kind) {
+    case "driveFolder": return `folder:${target.folderId}`;
+    case "driveFile": return `file:${target.fileId}`;
+    case "doc": return `file:${target.documentId}`;
+    case "sheets": return `file:${target.spreadsheetId}`;
+    case "slides": return `file:${target.presentationId}`;
+    default: return undefined;
+  }
+}
+
 @validateRpc()
 export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorRpc {
   constructor(getToken: () => Promise<GoogleAccessToken>) {
@@ -519,9 +545,15 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
 
   /**
    * Search spans My Drive, "Shared with me" and every shared drive, wherever the picker is open;
-   * a folder's listing spans them too, since its id does not say which it lives in.
+   * a folder's listing spans them too, since its id does not say which it lives in. A pasted link
+   * is answered with the one node it names, found as a pre-filled value is.
    */
   async listDriveNodes(parentId: string, query: string, cursor: string | null): Promise<DriveNodePage> {
+    let linked = linkedDriveNodeId(query);
+    if (linked) {
+      let node = await this.getDriveNode(linked);
+      return { nodes: node ? [node] : [] };
+    }
     let drive = new DriveApi(googleTokenProvider(this));
     let page = { pageSize: DRIVE_PAGE_SIZE, ...(cursor ? { pageToken: cursor } : {}) };
     return withDriveApiEnabled<DriveNodePage>(DRIVE_BROWSE_DISABLED, async () => {

@@ -141,7 +141,7 @@ export default {
           }}
           onChange={next => setValues({ target: next })}
           icons={ICONS}
-          searchPlaceholder="Search all of Drive…"
+          searchPlaceholder="Search all of Drive or paste a link…"
         />
       </Field>
     </Section>;
