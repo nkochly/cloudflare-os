@@ -5,7 +5,7 @@ import {
   GOOGLE_DRIVE_FILE_RESOURCE, GOOGLE_DRIVE_FOLDER_RESOURCE, GOOGLE_DRIVE_RESOURCE,
   GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE, IDENTITY_SCOPES,
   LEGACY_GRANTED_RESOURCE_URL_PATTERNS, OFFICE_IMPORT_GRANT, RESOURCE_BY_KIND, RESOURCE_SCOPES,
-  SCOPE_DERIVED_RESOURCE_URL_PATTERNS, SUPPORTED_RESOURCES, creatableKind,
+  SCOPE_DERIVED_RESOURCE_URL_PATTERNS, SHARED_DRIVES_GRANT, SUPPORTED_RESOURCES, creatableKind,
   grantedResourceUrlPatterns, hasDriveResourceGrant, isPrivateGrant,
   nativeFileUrl, parseResourceUrl,
   recordedResourceUrlPatterns, resourceUrlPatternsToOAuthScopes, resourcesCoveredByScopes,
@@ -837,5 +837,31 @@ describe("Office import grant", () => {
     let declined = { ...grant, oauthScopes: resourceUrlPatternsToOAuthScopes([GOOGLE_SHEETS_RESOURCE.urlPattern]) };
     expect(grantedResourceUrlPatterns(declined)).toEqual([GOOGLE_SHEETS_RESOURCE.urlPattern]);
     expect(recordedResourceUrlPatterns(declined)).toContain(OFFICE_IMPORT_GRANT);
+  });
+});
+
+describe("shared drives grant", () => {
+  const DRIVE_READONLY = "https://www.googleapis.com/auth/drive.readonly";
+
+  it("is a private grant, not a resource anything can list, offer or bind", () => {
+    expect(isPrivateGrant(SHARED_DRIVES_GRANT)).toBe(true);
+    expect(SUPPORTED_RESOURCES.map(resource => resource.urlPattern)).not.toContain(SHARED_DRIVES_GRANT);
+    expect(messageFor(SHARED_DRIVES_GRANT)).toBeTruthy();
+  });
+
+  it("asks for drive.readonly only, which full drive also covers", () => {
+    expect(resourceUrlPatternsToOAuthScopes([SHARED_DRIVES_GRANT])).toEqual([...IDENTITY_SCOPES, DRIVE_READONLY]);
+    expect(resourcesCoveredByScopes([SHARED_DRIVES_GRANT], ["https://www.googleapis.com/auth/drive"]))
+      .toEqual([SHARED_DRIVES_GRANT]);
+  });
+
+  // drive.readonly covers every Drive resource's scopes, but a resource is granted only when chosen.
+  it("implies no Drive resource", () => {
+    let grant = {
+      resourceUrlPatterns: [SHARED_DRIVES_GRANT],
+      oauthScopes: resourceUrlPatternsToOAuthScopes([SHARED_DRIVES_GRANT]),
+    };
+    expect(grantedResourceUrlPatterns(grant)).toEqual([SHARED_DRIVES_GRANT]);
+    expect(hasDriveResourceGrant(grantedResourceUrlPatterns(grant))).toBe(false);
   });
 });

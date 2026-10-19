@@ -1,6 +1,7 @@
 import {
-  Field, h, HierarchyPicker, Section,
-  type ConfiguratorUIHierarchyAncestor, type ConfiguratorUIHierarchyItem, type ConfiguratorUISpec,
+  Button, Field, Fragment, h, HierarchyPicker, Notice, Section,
+  type ConfiguratorUIHierarchyAncestor, type ConfiguratorUIHierarchyItem,
+  type ConfiguratorUIRenderContext, type ConfiguratorUISpec,
 } from "@gadgets/configurator-ui";
 import type {
   DriveConfiguratorRpc, DriveConfiguratorValues, DriveNode, DriveNodeAncestor,
@@ -95,6 +96,29 @@ const toItem = (node: DriveNode, accepted: readonly string[] | undefined): Confi
   };
 };
 
+type Context = ConfiguratorUIRenderContext<DriveConfiguratorRpc, DriveConfiguratorValues>;
+type Note = { text: string; tone?: "error" };
+
+/**
+ * The grant a location needs that the account lacks (shared drives), while the picker shows that it
+ * could not list it, and what asking for the grant came to. Module state, as the runtime keeps none
+ * for a module.
+ */
+let access: { grant: string; note?: Note } | null = null;
+
+/** Asks from the click, so the browser lets Workshop open Google's consent pop-up. */
+const allow = async ({ ensureResources, setValues }: Context, grant: string) => {
+  const note = await ensureResources([grant]).then(
+    (held): Note => ({ text: held ? "Access is allowed. Select Retry." : "Allow access in Google's window, then select Retry." }),
+    (error: unknown): Note => ({
+      text: error instanceof Error && error.message ? error.message : "Access wasn't allowed.",
+      tone: "error",
+    }));
+  if (access?.grant !== grant) return;
+  access = { grant, note };
+  setValues({});
+};
+
 export default {
   initial: { target: null },
   initialValuesFromResourceUrl: ({ resourceUrl }) => {
@@ -118,7 +142,9 @@ export default {
     }
     throw new Error("Choose what to connect.");
   },
-  render({ values: { target = null }, setValues, ui, acceptedResourceUrlPatterns: accepted }) {
+  render(context) {
+    const { values: { target = null }, setValues, ui, acceptedResourceUrlPatterns: accepted } = context;
+    const pending = access;
     return <Section>
       <Field label="What to connect">
         <HierarchyPicker
@@ -133,6 +159,15 @@ export default {
           }}
           loadItems={async ({ parentId, query, cursor }) => {
             const page = await ui.listDriveNodes(parentId, query, cursor);
+            if (page.needsGrant) {
+              access = { grant: page.needsGrant };
+              setValues({});
+              throw new Error("Listing shared drives needs one more permission from Google. Allow it below, then select Retry.");
+            }
+            if (access) {
+              access = null;
+              setValues({});
+            }
             return { items: page.nodes.map(node => toItem(node, accepted)), nextCursor: page.nextCursor };
           }}
           loadItem={async id => {
@@ -144,6 +179,14 @@ export default {
           searchPlaceholder="Search all of Drive or paste a link…"
         />
       </Field>
+      {pending && <Fragment>
+        <Notice>
+          Google will ask to let this app "View and download all your Drive files". It is used only to
+          list your shared drives: a connection still reaches only what you choose.
+        </Notice>
+        <Button onClick={() => void allow(context, pending.grant)}>Allow access</Button>
+        {pending.note && <Notice tone={pending.note.tone}>{pending.note.text}</Notice>}
+      </Fragment>}
     </Section>;
   },
 } satisfies ConfiguratorUISpec<DriveConfiguratorRpc, DriveConfiguratorValues>;

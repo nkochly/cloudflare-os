@@ -320,9 +320,9 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
 ];
 
 /**
- * Wider Drive grants. `drive.readonly` is requested only by {@link OFFICE_IMPORT_GRANT}; full
- * `drive` never is, and appears only in {@link SCOPE_COVERED_BY}, where it truthfully subsumes the
- * narrow requirements.
+ * Wider Drive grants. `drive.readonly` is requested only by {@link OFFICE_IMPORT_GRANT} and
+ * {@link SHARED_DRIVES_GRANT}; full `drive` never is, and appears only in {@link SCOPE_COVERED_BY},
+ * where it truthfully subsumes the narrow requirements.
  */
 const DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly";
 const DRIVE_READWRITE_SCOPE = "https://www.googleapis.com/auth/drive";
@@ -339,9 +339,20 @@ const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
  */
 export const OFFICE_IMPORT_GRANT = "https://docs.google.com/import";
 
+/**
+ * The grant that lets the Drive picker list the shared drives this account belongs to:
+ * `drives.list` accepts only `drive.readonly` or `drive`, which no Drive resource requests.
+ *
+ * Private, as {@link OFFICE_IMPORT_GRANT} is, and asked for only by the picker's Allow access
+ * button, so an account that never opens Shared drives is never asked for it. The picker uses it
+ * for nothing but that listing, and binding scope stays enforced by the gatekeepers' code.
+ */
+export const SHARED_DRIVES_GRANT = "https://drive.google.com/drive/shared-drives";
+
 /** Grants requested and recorded like resources, but never bindable or shown to the Workshop. */
 const PRIVATE_GRANT_SCOPES: {urlPattern: string, scopes: string[]}[] = [
   { urlPattern: OFFICE_IMPORT_GRANT, scopes: [DRIVE_READONLY_SCOPE, DRIVE_FILE_SCOPE] },
+  { urlPattern: SHARED_DRIVES_GRANT, scopes: [DRIVE_READONLY_SCOPE] },
 ];
 
 /** Every grant's scopes, resources first: what consent asks for and what coverage is checked on. */

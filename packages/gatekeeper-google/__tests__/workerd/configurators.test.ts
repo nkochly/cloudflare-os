@@ -17,7 +17,7 @@ import { FOLDER_MIME_TYPE as FOLDER, SHORTCUT_MIME_TYPE as SHORTCUT } from "../.
 import { OfficeConversion } from "../../src/office-conversion";
 import {
   GOOGLE_DOC_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE, OFFICE_IMPORT_GRANT,
-  resourceUrlPatternsToOAuthScopes,
+  SHARED_DRIVES_GRANT, resourceUrlPatternsToOAuthScopes,
 } from "../../src/resources";
 
 const token = (value: string): GoogleAccessToken => ({
@@ -44,7 +44,8 @@ describe("Google resource configurators", () => {
   });
 
   describe("Drive picker", () => {
-    const picker = () => new DriveConfiguratorUI(async () => token("access-token"));
+    const picker = (holdsSharedDrivesGrant = true) =>
+      new DriveConfiguratorUI(async () => token("access-token"), async () => holdsSharedDrivesGrant);
 
     /** Answers each Drive request from `routes` by path, recording every URL asked for. */
     const stubDrive = (routes: Record<string, unknown>) => {
@@ -125,6 +126,15 @@ describe("Google resource configurators", () => {
         nodes: [{ id: "file:s1", title: "Budget", kind: "file", mimeType: "application/pdf" }],
       });
       expect(calls[1].searchParams.get("q")).toBe("trashed = false and sharedWithMe = true");
+    });
+
+    // `drives.list` needs `drive.readonly`, which browsing does not, so the picker asks for it.
+    it("names the grant listing shared drives needs, without asking Drive, until the account holds it", async () => {
+      const calls = stubDrive({ "/drives": { drives: [] } });
+
+      await expect(picker(false).listDriveNodes("shared-drives", "", null))
+        .resolves.toEqual({ nodes: [], needsGrant: SHARED_DRIVES_GRANT });
+      expect(calls).toEqual([]);
     });
 
     // Search spans every corpus wherever the picker is open, so each result says whose it is.
@@ -229,6 +239,25 @@ describe("Google resource configurators", () => {
         id: "folder:D2",
         path: [{ id: "shared-drives", title: "Shared drives" }, { id: "folder:0ADrive", title: "Engineering" }],
       });
+    });
+
+    // The walk costs a request per level, so it stops 20 folders up.
+    it.each([
+      ["shows the path of a node 20 folders down", 20, 20],
+      ["leaves out the path of a node deeper than that", 21, undefined],
+    ])("%s", async (_, depth, pathLength) => {
+      const ids = Array.from({ length: depth }, (_, index) => `F${index}`);
+      stubDrive({
+        "/files/leaf": { id: "leaf", name: "Leaf.pdf", mimeType: "application/pdf", parents: [ids[0]] },
+        ...Object.fromEntries(ids.map((id, index) => [`/files/${id}`, {
+          id, name: id, mimeType: FOLDER, ...(index + 1 < depth ? { parents: [ids[index + 1]] } : {}),
+        }])),
+        "/files/root": { id: ids.at(-1), name: "My Drive", mimeType: FOLDER },
+      });
+
+      const node = await picker().getDriveNode("file:leaf");
+
+      expect(node?.path?.length).toBe(pathLength);
     });
 
     // A partial path would show the node somewhere it is not.

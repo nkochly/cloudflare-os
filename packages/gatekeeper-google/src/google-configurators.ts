@@ -30,7 +30,7 @@ import type { ChatThreadConfiguratorRpc } from "./configurator/chat-thread-confi
 import type {
   DriveConfiguratorRpc, DriveNode, DriveNodeAncestor, DriveNodePage,
 } from "./configurator/drive-configurator-types";
-import { parseResourceUrl } from "./resources";
+import { parseResourceUrl, SHARED_DRIVES_GRANT } from "./resources";
 
 /**
  * Mints an access token for a configurator, forwarding `AccessTokenRequest` to the `UserAccount`
@@ -40,6 +40,7 @@ type ConfiguratorTokenGetter = (opts?: AccessTokenRequest) => Promise<GoogleAcce
 
 const googleTokenGetters = new WeakMap<object, ConfiguratorTokenGetter>();
 const officeConversions = new WeakMap<object, OfficeConversion>();
+const sharedDrivesGrantChecks = new WeakMap<object, () => Promise<boolean>>();
 const calendarConfiguratorCaches = new WeakMap<object, Promise<ConfiguratorOption[]>>();
 const bigQueryConfiguratorCaches = new WeakMap<object, Map<string, ConfiguratorOption[]>>();
 const BIGQUERY_CONFIGURATOR_CACHE_MAX_ENTRIES = 200;
@@ -462,7 +463,7 @@ function driveFileNode(file: DriveFile, detail?: string): DriveNode | undefined 
     if (!file.shortcutDetails?.targetId) return undefined;
     id = file.shortcutDetails.targetId;
     mimeType = file.shortcutDetails.targetMimeType;
-    // A listing does not carry the target's capabilities; opening or binding it checks them.
+    // A listing does not carry the target's capabilities; connecting to it checks them.
     listable = true;
   }
   let shown = {
@@ -538,9 +539,10 @@ function linkedDriveNodeId(text: string): string | undefined {
 
 @validateRpc()
 export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorRpc {
-  constructor(getToken: () => Promise<GoogleAccessToken>) {
+  constructor(getToken: () => Promise<GoogleAccessToken>, holdsSharedDrivesGrant: () => Promise<boolean>) {
     super();
     googleTokenGetters.set(this, getToken);
+    sharedDrivesGrantChecks.set(this, holdsSharedDrivesGrant);
   }
 
   /**
@@ -575,6 +577,11 @@ export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorR
         };
       }
       if (parentId === SHARED_DRIVES.id) {
+        // Drive lists shared drives only under a wider grant than browsing needs, so the picker asks
+        // for it when the user first opens them.
+        if (!(await sharedDrivesGrantChecks.get(this)!())) {
+          return { nodes: [], needsGrant: SHARED_DRIVES_GRANT };
+        }
         let { drives, nextPageToken } = await drive.listSharedDrives(page);
         return {
           nodes: tellApartSameNamed(drives.map(({ id, name }) => ({

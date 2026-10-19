@@ -105,6 +105,7 @@ import {
   GOOGLE_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE, RESOURCE_BY_KIND,
   SUPPORTED_RESOURCES, creatableKind, nativeFileUrl,
   grantedResourceUrlPatterns, hasDriveResourceGrant, isPrivateGrant, OFFICE_IMPORT_GRANT,
+  SHARED_DRIVES_GRANT,
   parseResourceUrl, recordedResourceUrlPatterns, type RecordedResourceGrant,
 } from "./resources";
 import {
@@ -896,10 +897,12 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     let id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     let account = this.ctx.exports.UserAccount.get(id);
     let getToken = async (opts?: AccessTokenRequest) => await account.getAccessToken(opts);
-    // The grant is read on every call, since it arrives through a pop-up while the dialog is open.
+    // A private grant is read on every call, since it arrives through a pop-up while the dialog is
+    // open.
+    let holds = (grant: string) => async () =>
+      (await account.getGrantedResourceUrlPatterns()).includes(grant);
     let officeConversion = (kind: OfficeKind) => new OfficeConversion(
-      kind, async opts => (await getToken(opts)).token,
-      async () => (await account.getGrantedResourceUrlPatterns()).includes(OFFICE_IMPORT_GRANT));
+      kind, async opts => (await getToken(opts)).token, holds(OFFICE_IMPORT_GRANT));
 
     if (resourceUrlPattern === BIGQUERY_RESOURCE.urlPattern) {
       return {
@@ -970,7 +973,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
         resourceUrlPattern === GOOGLE_DRIVE_FILE_RESOURCE.urlPattern) {
       return {
         iframeHtml: DRIVE_CONFIGURATOR_HTML,
-        ui: new RpcStub(new DriveConfiguratorUI(getToken)),
+        ui: new RpcStub(new DriveConfiguratorUI(getToken, holds(SHARED_DRIVES_GRANT))),
       };
     }
 

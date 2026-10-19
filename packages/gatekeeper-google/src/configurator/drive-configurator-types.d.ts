@@ -24,7 +24,15 @@ export type DriveNode = {
   path?: DriveNodeAncestor[];
 };
 
-export type DriveNodePage = { nodes: DriveNode[]; nextCursor?: string };
+export type DriveNodePage = {
+  nodes: DriveNode[];
+  nextCursor?: string;
+  /**
+   * The grant to ask for with `ensureResources` when this location cannot be listed without it
+   * (shared drives); the page then has no nodes.
+   */
+  needsGrant?: string;
+};
 
 export interface DriveConfiguratorRpc {
   /**
