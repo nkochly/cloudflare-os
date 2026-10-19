@@ -1,5 +1,7 @@
 # Timeline read state
 
+For the web inbox, viewport reading and native badge bridge, see [unread state consumers](user-unread-ui.md).
+
 ## Semantics
 
 Each user has an inclusive read pointer into each thread's persisted, ordered timeline, and
