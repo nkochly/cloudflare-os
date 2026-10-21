@@ -760,10 +760,21 @@ describe("gateway model reasoning levels", () => {
     input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
     stream: true, store: false, ...extra,
   });
-  // An OpenAI request that asks for an effort, which also asks for the reasoning back.
-  const gptEffortBody = (config: GatewayConfig, effort: string) => gptBody(config, {
-    reasoning: { effort, summary: "auto" }, include: ["reasoning.encrypted_content"],
-  });
+  // An OpenAI request that asks for an effort, which also asks for the reasoning back. For a model
+  // that takes a mid-conversation effort, pi fixes the request's effort at medium and carries the
+  // level in a configuration update after the prompt.
+  const gptEffortBody = (config: GatewayConfig, effort: string, midConversation = true) =>
+    midConversation ? {
+      ...gptBody(config, {
+        reasoning: { effort: "medium", summary: "auto" }, include: ["reasoning.encrypted_content"],
+      }),
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "hello" }] },
+        { type: "configuration_update", reasoning: { effort } },
+      ],
+    } : gptBody(config, {
+      reasoning: { effort, summary: "auto" }, include: ["reasoning.encrypted_content"],
+    });
   const completionsBody = (config: GatewayConfig, extra: object = {}) => ({
     model: config.model, messages: [{ role: "user", content: "hello" }], stream: true,
     stream_options: { include_usage: true }, ...extra,
@@ -953,7 +964,7 @@ describe("gateway model reasoning levels", () => {
     const handle = getModel(env({ CF_AI_GATEWAY: undefined }),
         { ...GPT, apiToken: "direct-api-token", reasoning: "max" }, INITIATOR);
     expect(JSON.parse((await captureRequest(handle)).body))
-        .toEqual(gptEffortBody(GPT, "medium"));
+        .toEqual(gptEffortBody(GPT, "medium", false));
   });
 
   const LOW_TO_MAX = ["low", "medium", "high", "xhigh", "max"];
@@ -962,7 +973,7 @@ describe("gateway model reasoning levels", () => {
     ["anthropic", "claude-opus-5-5", LOW_TO_MAX],
     ["anthropic", "claude-sonnet-5-5", LOW_TO_MAX],
     ["anthropic", "claude-fable-5-1", ["minimal", ...LOW_TO_MAX]],
-    ["anthropic", "claude-opus-5", ["minimal", ...LOW_TO_MAX]],
+    ["anthropic", "claude-opus-5", ["off", "minimal", ...LOW_TO_MAX]],
     ["anthropic", "claude-sonnet-5", ["off", "minimal", ...LOW_TO_MAX]],
     ["anthropic", "claude-haiku-4-5", OFF_TO_HIGH],
     ["openai", "gpt-6.1-sol", LOW_TO_MAX],
@@ -1278,7 +1289,7 @@ describe("gateway model reasoning levels", () => {
         async (stated, effort) => {
       const gpt = stating(GPT_NEXT, ...stated);
       expect(builtIn(gpt)).toBe(effort);
-      expect(await parsed(gpt)).toEqual(gptEffortBody(GPT_NEXT, effort));
+      expect(await parsed(gpt)).toEqual(gptEffortBody(GPT_NEXT, effort, false));
     });
 
     it("sends a Workers AI model a stated level as its effort, and none while no level is set",
@@ -1312,14 +1323,14 @@ describe("gateway model reasoning levels", () => {
     it("asks an OpenAI model for a stated level by its own name", async () => {
       const gpt = stating(GPT_NEXT, "off", "minimal", "xhigh", "max");
       for (const level of ["minimal", "xhigh", "max"] as const) {
-        expect(await parsed({ ...gpt, reasoning: level })).toEqual(gptEffortBody(GPT_NEXT, level));
+        expect(await parsed({ ...gpt, reasoning: level })).toEqual(gptEffortBody(GPT_NEXT, level, false));
       }
-      expect(await parsed({ ...gpt, reasoning: "low" })).toEqual(gptEffortBody(GPT_NEXT, "xhigh"));
+      expect(await parsed({ ...gpt, reasoning: "low" })).toEqual(gptEffortBody(GPT_NEXT, "xhigh", false));
       expect(await parsed({ ...gpt, reasoning: "off" }))
           .toEqual(gptBody(GPT_NEXT, { reasoning: { effort: "none" } }));
       // One that is not stated to stop reasoning is asked for its lowest level.
       expect(await parsed({ ...stating(GPT_NEXT, "high", "max"), reasoning: "off" }))
-          .toEqual(gptEffortBody(GPT_NEXT, "high"));
+          .toEqual(gptEffortBody(GPT_NEXT, "high", false));
     });
 
     it("gives an Anthropic model a stated level as a budget, or as the effort of the model " +

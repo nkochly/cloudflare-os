@@ -14,10 +14,11 @@
     "import:bundled-blueprint": "node scripts/import-bundled-blueprint.ts"
   },
   "dependencies": {
-    "@cloudflare/computer": "0.5.1",
+    "@cloudflare/computer": "0.6.0",
     "@cloudflare/puppeteer": "^1.4.0",
-    "@earendil-works/pi-agent-core": "1.0.2",
-    "@earendil-works/pi-ai": "1.0.2",
+    "@earendil-works/pi-agent-core": "1.3.0",
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-durable": "1.3.0",
     "@gadgets/error-reporting": "workspace:*",
     "@gadgets/observability": "workspace:*",
     "@gadgets/typed-storage": "workspace:*",
