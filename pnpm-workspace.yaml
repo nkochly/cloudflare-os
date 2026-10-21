@@ -78,8 +78,10 @@ minimumReleaseAgeExclude:
 
 allowBuilds:
   '@google/genai': true
+  '@mongodb-js/zstd': false
   core-js-pure: true
   esbuild: true
+  node-liblzma: false
   protobufjs: true
   sharp: true
   workerd: true

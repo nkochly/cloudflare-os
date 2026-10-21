@@ -14,6 +14,7 @@
     "import:bundled-blueprint": "node scripts/import-bundled-blueprint.ts"
   },
   "dependencies": {
+    "@cloudflare/computer": "0.5.1",
     "@cloudflare/puppeteer": "^1.4.0",
     "@earendil-works/pi-agent-core": "1.0.2",
     "@earendil-works/pi-ai": "1.0.2",
@@ -21,6 +22,7 @@
     "@gadgets/observability": "workspace:*",
     "@gadgets/typed-storage": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
+    "@platformatic/vfs": "0.5.0",
     "capnweb": "catalog:",
     "capnweb-validate": "catalog:",
     "diff": "catalog:",
