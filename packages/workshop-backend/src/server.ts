@@ -24,6 +24,8 @@ import { GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl, nor
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
 import { UserDirectoryDurableObject } from "./user-directory.js";
 import { ExternalMessageGateway } from "./external-message-gateway";
+import { exportJobGadget, finishJob, startJob, type JobAccount, type JobOverseer } from "./owner-jobs";
+import type { FinishJobInput, JobResult, StartJobInput, StartJobResult } from "@gadgets/workshop-shared/owner-jobs";
 import { RpcStub as NativeRpcStub, WorkerEntrypoint } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
 import { handleClientErrorRequest } from "./client-errors.js";
@@ -82,13 +84,50 @@ export { ExternalMessageGateway };
 /** The API as the existing account its binding names: the binding is the credential, as for ExternalMessageGateway. */
 export class OwnerApi extends WorkerEntrypoint<Env, { email: string }> {
   async open(): Promise<AuthenticatedApi> {
-    let email = this.ctx.props.email?.trim();
-    if (!email) throw new Error("OwnerApi email prop is required.");
+    let email = this.#email();
     let id = this.ctx.exports.UserDurableObject.idFromName(email);
     if (!await this.ctx.exports.UserDurableObject.get(id).whoamiIfExists()) {
       throw new Error("No account for the bound email; sign in once in the browser first.");
     }
     return new AuthenticatedApiImpl(this.ctx, this.env, id, () => {});
+  }
+
+  /** Starts a headless build job in the app's workspace (owner-jobs.ts). */
+  async startJob(input: StartJobInput): Promise<StartJobResult> {
+    let email = this.#email();
+    await this.open();
+    return startJob(input, email, name =>
+      this.ctx.exports.OverseerDurableObject.getByName(name) as unknown as JobOverseer);
+  }
+
+  /** Merges a job's chat when nothing waits on a person and reports the workspace as data. */
+  async finishJob(input: FinishJobInput): Promise<JobResult> {
+    return finishJob(input, await this.open() as unknown as JobAccount);
+  }
+
+  /** Every app the account can see, one entry per gadget. */
+  async listApps(): Promise<ListOutputsResult> {
+    return (await this.open()).listOutputs();
+  }
+
+  /** Exports one gadget, live or from a chat's draft; browser formats render with Browser Run. */
+  async exportGadget(input: {workspaceId: string; gadgetId: number; format: string; chatId?: number})
+      : Promise<ReadableStream<Uint8Array>> {
+    return exportJobGadget(await this.open() as unknown as JobAccount, input);
+  }
+
+  /** Approves or rejects one pending action in a workspace. */
+  async decideAction(input: {workspaceId: string; actionId: number; approve: boolean}): Promise<void> {
+    if (!/^[0-9a-f]{64}$/.test(input.workspaceId)) throw new Error("The workspace id is not valid.");
+    let ws = await (await this.open()).openGadget(input.workspaceId);
+    if (input.approve) await ws.approveAction(input.actionId);
+    else await ws.rejectAction(input.actionId);
+  }
+
+  #email(): string {
+    let email = this.ctx.props.email?.trim();
+    if (!email) throw new Error("OwnerApi email prop is required.");
+    return email;
   }
 }
 

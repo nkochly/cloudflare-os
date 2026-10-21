@@ -34,6 +34,10 @@
     "./theme": {
       "types": "./src/theme.ts",
       "import": "./src/theme.ts"
+    },
+    "./owner-jobs": {
+      "types": "./src/owner-jobs.ts",
+      "import": "./src/owner-jobs.ts"
     }
   },
   "scripts": {
