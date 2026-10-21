@@ -24,7 +24,7 @@ import { GatekeeperConnectCallbackImpl, GatekeeperUserSelectionExchangeImpl, nor
 import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, GadgetTailLoopback, AgentSelfLoopback } from "./overseer";
 import { UserDirectoryDurableObject } from "./user-directory.js";
 import { ExternalMessageGateway } from "./external-message-gateway";
-import { RpcStub as NativeRpcStub } from "cloudflare:workers";
+import { RpcStub as NativeRpcStub, WorkerEntrypoint } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
 import { handleClientErrorRequest } from "./client-errors.js";
 import { verifyCfAccessJwt } from "./access.js";
@@ -78,6 +78,19 @@ export { OverseerDurableObject, GatekeeperLoopback, GatekeeperHookLoopback,
 
 // Re-export service-binding entrypoint for external channel integrations.
 export { ExternalMessageGateway };
+
+/** The API as the existing account its binding names: the binding is the credential, as for ExternalMessageGateway. */
+export class OwnerApi extends WorkerEntrypoint<Env, { email: string }> {
+  async open(): Promise<AuthenticatedApi> {
+    let email = this.ctx.props.email?.trim();
+    if (!email) throw new Error("OwnerApi email prop is required.");
+    let id = this.ctx.exports.UserDurableObject.idFromName(email);
+    if (!await this.ctx.exports.UserDurableObject.get(id).whoamiIfExists()) {
+      throw new Error("No account for the bound email; sign in once in the browser first.");
+    }
+    return new AuthenticatedApiImpl(this.ctx, this.env, id, () => {});
+  }
+}
 
 // Declare optional environment variables here since they may be omitted from wrangler.jsonc.
 type Env = Cloudflare.Env & {
