@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AiChatAuthorInfo, UserNotification } from "@gadgets/workshop-shared/api";
 import type { OverseerDurableObject } from "../src/overseer";
 import { UserDurableObject } from "../src/user";
-import { openFakeOverseer } from "./fixtures";
+import { alarmTime, runAlarmJob, openFakeOverseer } from "./fixtures";
 import type { FakeChatResponseTarget } from "./response-target";
 
 const CHAT = 1;
@@ -162,7 +162,7 @@ describe("decision handoff using the existing execution row", () => {
       await client.acceptConnectionRequest("1:connection", {gatekeeperId: 31});
       expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toEqual(MODEL.profile);
       expect(impl.storage.activeAgents.get(CHAT)?.initiatorUserId).toBe(s.user.id.toString());
-      expect(await impl.ctx.storage.getAlarm()).not.toBeNull();
+      expect(await alarmTime(impl)).not.toBeNull();
       expect([...impl.storage.chats.list()].filter(m => m.type === "agentNudge")).toHaveLength(1);
       await impl.ctx.storage.sync();
       expect(lookup).toHaveBeenCalledTimes(1);
@@ -325,7 +325,7 @@ describe("decision handoff using the existing execution row", () => {
         await impl.waitForAllAgentsToComplete();
         expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
         expect(impl.storage.activeAgents.get(CHAT)?.initiatorUserId).toBe(s.user.id.toString());
-        expect(await impl.ctx.storage.getAlarm()).toBeNull();
+        expect(await alarmTime(impl)).toBeNull();
       });
     }
     await vi.waitFor(() => expect(notifications).toEqual([[s.user.id.toString(), expect.objectContaining({
@@ -498,14 +498,14 @@ describe("decision handoff using the existing execution row", () => {
       await impl.waitForAllAgentsToComplete();
       expect(impl.storage.activeAgents.get(CHAT)?.resumeAttempts).toBe(1);
       for (let attempt = 2; attempt <= 4; attempt++) {
-        await impl.ctx.storage.deleteAlarm(); // The platform consumed the scheduled alarm.
+        await impl.jobs.cancel("workspace-alarm"); // The platform consumed the scheduled alarm.
         if (attempt < 4) {
           await expect(impl.runAlarmTasks(0)).rejects.toThrow("reset");
           expect(impl.storage.activeAgents.get(CHAT)?.resumeAttempts).toBe(attempt);
           // An unrelated response-delivery pass recomputes the shared alarm, resetting its
           // platform retry count. It must not reset this execution's budget.
           await impl.deliverReadyExternalMessageResponses();
-          expect(await impl.ctx.storage.getAlarm()).not.toBeNull();
+          expect(await alarmTime(impl)).not.toBeNull();
         } else {
           await expect(impl.runAlarmTasks(0)).resolves.toBeUndefined();
         }
@@ -557,7 +557,7 @@ describe("decision handoff using the existing execution row", () => {
       impl.cancelAgent(CHAT);
       expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
       expect(impl.storage.activeAgents.get(CHAT)).toBeUndefined();
-      expect(await impl.ctx.storage.getAlarm()).toBeNull();
+      expect(await alarmTime(impl)).toBeNull();
       await expect(impl.runAlarmTasks()).resolves.toBeUndefined();
     });
   });
@@ -634,17 +634,17 @@ describe("decision handoff using the existing execution row", () => {
         promptSequence: 0, createdAt: Date.now(), status: "ready", responseText: "Done.",
         chatGatewayRpcTarget: target});
       for (let retry = 0; retry <= 6; retry++) {
-        await impl.ctx.storage.deleteAlarm();
+        await impl.jobs.cancel("workspace-alarm");
         await expect(impl.runAlarmTasks(retry)).rejects.toThrow("Response target unavailable");
         expect(impl.storage.gadgetResponseDeliveries.get("external-response")?.status).toBe("ready");
       }
-      const next = await impl.ctx.storage.getAlarm();
+      const next = await alarmTime(impl);
       expect(next).toBeGreaterThan(Date.now()); // Avoid an immediate failure loop.
       await target.setAvailable(true);
       await impl.runAlarmTasks();
       expect(await target.calls()).toBe(8);
       expect(impl.storage.gadgetResponseDeliveries.get("external-response")?.status).toBe("delivered");
-      expect(await impl.ctx.storage.getAlarm()).toBeGreaterThan(next!); // Retention sweep only.
+      expect(await alarmTime(impl)).toBeGreaterThan(next!); // Retention sweep only.
     });
   });
 
@@ -655,12 +655,12 @@ describe("decision handoff using the existing execution row", () => {
     await s.visit(async impl => {
       decide(impl, "connection");
       impl.addChatMessages(CHAT, USER, [{type: "agentNudge", text: "Continue."}]);
-      await impl.ctx.storage.setAlarm(scheduled);
+      await impl.jobs.push({id: "workspace-alarm", fn: "runAlarmTasks", time: scheduled});
     });
     await evictDurableObject(s.stub);
     await s.visit(async impl => {
       await vi.waitFor(() => expect(requests()).toBe(1));
-      expect(await impl.ctx.storage.getAlarm()).toBe(scheduled);
+      expect(await alarmTime(impl)).toBe(scheduled);
       gate.resolve();
       await impl.waitForAllAgentsToComplete();
     });

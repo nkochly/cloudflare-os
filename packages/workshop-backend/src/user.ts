@@ -25,6 +25,8 @@ import {
   DEVICE_HANDOFF_LIFETIME_MS, isDeviceHandoffState, sealDeviceSessionHandoff,
   type DeviceSessionCredential, type DeviceSessionHandoff,
 } from "./auth/device-session-handoff.js";
+import { startLifecycle } from "./lifecycle-name";
+import { Lifecycle, type LifecycleJobContext } from "agents/lifecycle";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -199,14 +201,24 @@ async function checkGatekeeperVendorFilter(
 }
 
 /** Durable Object that stores information about a user. */
+/** The id of the expiry sweep, the user object's one host job in the Lifecycle queue. */
+const EXPIRY_SWEEP_JOB = "expiry-sweep";
+
 export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: UserStorage;
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
   #notificationSubscribers = new Map<object, RpcStub<NotificationSubscriber>>();
 
+  // The object's one physical alarm belongs to the Lifecycle work queue; the expiry sweep is a host
+  // job in it (EXPIRY_SWEEP_JOB), dispatched to onJob.
+  readonly lifecycle: Lifecycle<Cloudflare.Env>;
+
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
+    this.lifecycle = Lifecycle.install(this);
+    // Native RPC bypasses the Lifecycle's automatic startup; the sweep job is pushed from RPCs.
+    ctx.blockConcurrencyWhile(() => startLifecycle(ctx, this.lifecycle));
 
     this.storage = makeUserStorage(ctx.storage);
     this.adminSettings = this.ctx.exports.AdminSettings;
@@ -2088,7 +2100,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (pending.sessionTokenId) this.storage.sessions.delete(pending.sessionTokenId);
   }
 
-  // Arm the alarm for the soonest pending expiry, including device sessions and picker selections.
+  // Arm the sweep job for the soonest pending expiry, including device sessions and picker selections.
   async #armExpirySweep(): Promise<void> {
     let next: number | undefined;
     let consider = (at: number) => { if (next === undefined || at < next) next = at; };
@@ -2115,17 +2127,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       consider(Date.now() + PENDING_HANDOFF_LIFETIME_MS);
     }
     if (next === undefined) {
-      await this.ctx.storage.deleteAlarm();
+      await this.lifecycle.jobs.cancel(EXPIRY_SWEEP_JOB);
     } else {
-      await this.ctx.storage.setAlarm(next);
+      await this.lifecycle.jobs.push({ id: EXPIRY_SWEEP_JOB, fn: "sweepExpired", time: next });
     }
+  }
+
+  async onJob({ job }: LifecycleJobContext): Promise<void> {
+    if (job.fn === "sweepExpired") await this.sweepExpired();
   }
 
   /**
    * Drop unconfirmed connect handoffs, abandoned connect flows and picker selections, and expired
    * device handoffs and sessions. Device handoff cleanup also deletes its unactivated session.
    */
-  async alarm(): Promise<void> {
+  async sweepExpired(): Promise<void> {
     let now = Date.now();
     let expiredFlows = Array.from(this.storage.pendingConnectFlows.list())
         .filter(flow => flow.expiresAt.getTime() <= now);

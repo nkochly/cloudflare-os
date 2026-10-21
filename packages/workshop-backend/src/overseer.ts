@@ -9,6 +9,8 @@ import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
 } from "cloudflare:workers";
+import { startLifecycle } from "./lifecycle-name";
+import { Lifecycle, type LifecycleJobContext, type LifecycleJobs } from "agents/lifecycle";
 import { keyString } from "@gadgets/typed-storage";
 import type { ListOptions } from "@gadgets/typed-storage";
 import {
@@ -467,6 +469,8 @@ const AGENT_KEEPALIVE_ALARM_MS = 60_000;
 // The platform retries a failed alarm six times. Other durable work must remain scheduled after
 // that budget is exhausted; model-lookup retries have their own per-execution budget below.
 const ALARM_MAX_RETRIES = 6;
+/** The id of the workspace's one host job in the Lifecycle queue. */
+const ALARM_JOB = "workspace-alarm";
 const AGENT_RESUME_MAX_ATTEMPTS = 4;
 
 // How old a workspace instance must be before a loop-limit rejection restarts it. See
@@ -986,8 +990,15 @@ class OverseerImpl implements AgentHooks {
     let next = times.length > 0 ? Math.max(notBefore, Math.min(...times)) : null;
     if (next === this.#scheduledAlarm) return;
     this.#scheduledAlarm = next;
-    if (next === null) this.ctx.storage.deleteAlarm();
-    else this.ctx.storage.setAlarm(next);
+    let armed = next === null
+        ? this.jobs.cancel(ALARM_JOB)
+        : this.jobs.push({
+          id: ALARM_JOB, fn: "runAlarmTasks", time: next,
+          retry: { maxAttempts: ALARM_MAX_RETRIES + 1, baseDelayMs: 1_000, maxDelayMs: 30_000 },
+        });
+    armed.catch(error => this.logger.error("failed to arm the alarm job", {
+      event: "alarm.job.arm.failed", error,
+    }));
   }
 
   // The body of the alarm handler: perform every concern the alarm exists for, together, and hold
@@ -1191,7 +1202,8 @@ class OverseerImpl implements AgentHooks {
     }
   }
 
-  constructor(public ctx: DurableObjectState, public env: Cloudflare.Env) {
+  constructor(public ctx: DurableObjectState, public env: Cloudflare.Env,
+              private readonly jobs: LifecycleJobs) {
     this.logger = logger.with({ gadgetId: ctx.id.toString() });
     this.storage = makeOverseerStorage(ctx.storage);
     this.gitStore = new GitStore(this.storage.gitObjects);
@@ -1230,9 +1242,9 @@ class OverseerImpl implements AgentHooks {
       migrateToActionIndexes(this);
       migrateToWorkpieceTypes(this);
       migrateToBlueprintUpstreams(this);
-      // Do not replace an existing alarm during constructor recovery: setAlarm would reset the
-      // platform's retry budget. Cache its time before registering any recovered executions.
-      this.#scheduledAlarm = await this.ctx.storage.getAlarm();
+      // Do not replace an existing alarm job during constructor recovery: a push would reset its
+      // retry budget. Cache its time before registering any recovered executions.
+      this.#scheduledAlarm = this.jobs.get(ALARM_JOB)?.time ?? null;
       if ([...this.storage.activeAgents.list()].some(r => this.storage.chatMeta.get(r.chatId)?.activeAgent)) {
         this.#agentKeepAliveTime = this.#scheduledAlarm ?? undefined;
       }
@@ -10172,27 +10184,35 @@ type OverseerRestoreParams = {
 export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   private impl: OverseerImpl;
 
+  // The object's one physical alarm belongs to the Lifecycle work queue; the workspace's concerns
+  // are one host job in it (ALARM_JOB), dispatched to onJob below.
+  readonly lifecycle: Lifecycle<Cloudflare.Env>;
+
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
-    this.impl = new OverseerImpl(ctx, env);
+    this.lifecycle = Lifecycle.install(this);
+    // Native RPC bypasses the Lifecycle's automatic startup, and the impl reads the job queue as it
+    // recovers, so start it here; the impl's own blockConcurrencyWhile runs after this one.
+    ctx.blockConcurrencyWhile(() => startLifecycle(ctx, this.lifecycle));
+    this.impl = new OverseerImpl(ctx, env, this.lifecycle.jobs);
   }
 
   /**
-   * The DO's one alarm (scheduled by #updateAlarm for the earliest time any concern below needs
-   * it) does all of the following, so whichever concern set it, none is missed:
+   * The workspace's alarm job (pushed by #updateAlarm for the earliest time any concern below
+   * needs it) does all of the following, so whichever concern set it, none is missed:
    * - Agent work outstanding for at least a minute -- a running turn, or a recorded call to a
    *   callable agent not yet appended to its chat. If the DO is still running when this is called,
    *   but the client has closed their browser and so isn't holding the DO alive anymore, the alarm
    *   handler takes over and holds the DO open until the work is done. If the DO died meanwhile,
    *   the alarm wakes it (and the constructor resumes the turns and drains the calls before
-   *   alarm() itself runs). If the DO dies *while* the alarm is running, the system retries the
-   *   alarm, picking the work up yet again.
+   *   the job itself runs). If the DO dies *while* the job is running, the Lifecycle's deadman
+   *   alarm runs it again, picking the work up yet again.
    * - External-message responses ready to deliver, and delivered records due to be swept.
    *
    * See OverseerImpl.runAlarmTasks for how the concerns are run together.
    */
-  async alarm(info?: AlarmInvocationInfo) {
-    await this.impl.runAlarmTasks(info?.retryCount);
+  async onJob({job, attempt}: LifecycleJobContext): Promise<void> {
+    if (job.fn === "runAlarmTasks") await this.impl.runAlarmTasks(attempt - 1);
   }
 
   // Initialize a brand-new workspace's storage. (Before git-backed code storage this also wrote

@@ -99,7 +99,7 @@ describe("connect handoff", () => {
       const [flow] = Array.from(user.storage.pendingConnectFlows.list());
       expect(flow).toMatchObject({ accountId: 0, nonceHash: await hashSecret(Uint8Array.fromHex(opened)) });
       expect(flow.expiresAt.getTime() - Date.now()).toBeLessThanOrEqual(CONNECT_FLOW_LIFETIME_MS);
-      expect(await user.ctx.storage.getAlarm()).toBe(flow.expiresAt.getTime());
+      expect((user.lifecycle.jobs.get("expiry-sweep")?.time ?? null)).toBe(flow.expiresAt.getTime());
 
       const staged = await user.stagePendingConnect(0, account, "github", new Date("2027-01-01"));
       expect(user.storage.connectedAccounts.get(0)).toBeUndefined();
@@ -107,7 +107,7 @@ describe("connect handoff", () => {
       expect(pending).toBeDefined();
       expect(pendingCount(user)).toBe(1);
       // The sweep is armed for the soonest expiry: the record's, which is within the lifetime.
-      expect(await user.ctx.storage.getAlarm()).toBe(pending.expiresAt.getTime());
+      expect((user.lifecycle.jobs.get("expiry-sweep")?.time ?? null)).toBe(pending.expiresAt.getTime());
       expect(pending.expiresAt.getTime() - Date.now()).toBeLessThanOrEqual(PENDING_HANDOFF_LIFETIME_MS);
       // Only the ticket's and the nonce's hashes are at rest.
       for (const [, value] of user.ctx.storage.kv.list()) {
@@ -151,10 +151,10 @@ describe("connect handoff", () => {
       expect(await fakeAccount(user, "expired").calls()).toEqual(["describe", "revoke"]);
       expect(pendingCount(user)).toBe(1);
       expect(flowCount(user)).toBe(0);
-      await user.alarm();
+      await user.sweepExpired();
       expect(pendingCount(user)).toBe(0);
       expect(await fakeAccount(user, "swept").calls()).toEqual(["describe", "revoke"]);
-      expect(await user.ctx.storage.getAlarm()).toBeNull();
+      expect((user.lifecycle.jobs.get("expiry-sweep")?.time ?? null)).toBeNull();
     });
   });
 
@@ -247,10 +247,10 @@ describe("connect handoff", () => {
       expect(() => pendingCount(user)).toThrow();
       const opened = await user.openConnectFlow(0);
       const staged = await user.stagePendingConnect(0, fakeAccount(user, "listable").account, "github");
-      const alarm = await user.ctx.storage.getAlarm();
+      const alarm = (user.lifecycle.jobs.get("expiry-sweep")?.time ?? null);
       expect(alarm).toBeGreaterThanOrEqual(before + PENDING_HANDOFF_LIFETIME_MS);
-      await user.alarm();
-      expect(await user.ctx.storage.getAlarm()).toBeGreaterThanOrEqual(before + PENDING_HANDOFF_LIFETIME_MS);
+      await user.sweepExpired();
+      expect((user.lifecycle.jobs.get("expiry-sweep")?.time ?? null)).toBeGreaterThanOrEqual(before + PENDING_HANDOFF_LIFETIME_MS);
       return { ticket: staged.ticket, nonce: opened };
     });
 
@@ -270,7 +270,7 @@ describe("connect handoff", () => {
       });
       await user.stagePendingRestore(0, STAGE_ID);
       expireAll(user.storage.pendingHandoffs);
-      await user.alarm();
+      await user.sweepExpired();
       expect(pendingCount(user)).toBe(0);
       expect(await fakeAccount(user, "live").calls()).toEqual([]);
       expect(user.storage.connectedAccounts.get(0)?.description).toEqual({ displayName: "live" });
@@ -304,11 +304,11 @@ describe("connect handoff", () => {
       expect(staleFlow).toMatchObject({ accountId: 0 });
       user.storage.pendingConnectFlows.put({ ...staleFlow, expiresAt: new Date(Date.now() - 1) });
 
-      await user.alarm();
+      await user.sweepExpired();
       const [live] = Array.from(user.storage.pendingConnectFlows.list());
       expect(flowCount(user)).toBe(1);
       expect(live.accountId).toBe(1);
-      expect(await user.ctx.storage.getAlarm()).toBe(live.expiresAt.getTime());
+      expect((user.lifecycle.jobs.get("expiry-sweep")?.time ?? null)).toBe(live.expiresAt.getTime());
     });
   });
 

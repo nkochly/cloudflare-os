@@ -339,7 +339,7 @@ describe("gatekeeper user picker selection tickets", () => {
     const presented = minted(await testHooks.pick(viewer, appAccount, picked));
     const swept = minted(await testHooks.pick(viewer, appAccount, picked));
     await inUser(viewer, async user => {
-      expect(await user.ctx.storage.getAlarm()).toBeGreaterThan(Date.now());
+      expect((user.lifecycle.jobs.get("expiry-sweep")?.time ?? null)).toBeGreaterThan(Date.now());
       // Snapshot first: a put during kv.list() invalidates the iterator.
       for (const record of Array.from(user.storage.pendingUserSelections.list())) {
         user.storage.pendingUserSelections.put({ ...record, expiresAt: new Date(Date.now() - 1) });
@@ -350,9 +350,9 @@ describe("gatekeeper user picker selection tickets", () => {
     await expect(testHooks.redeem(viewer, appAccount, presented.ticket)).resolves.toEqual(rejected);
     await inUser(viewer, async user => {
       expect(Array.from(user.storage.pendingUserSelections.list())).toHaveLength(1);
-      await user.alarm();
+      await user.sweepExpired();
       expect(Array.from(user.storage.pendingUserSelections.list())).toEqual([]);
-      expect(await user.ctx.storage.getAlarm()).toBeNull();
+      expect((user.lifecycle.jobs.get("expiry-sweep")?.time ?? null)).toBeNull();
     });
     await expect(testHooks.redeem(viewer, appAccount, swept.ticket)).resolves.toEqual(rejected);
   });

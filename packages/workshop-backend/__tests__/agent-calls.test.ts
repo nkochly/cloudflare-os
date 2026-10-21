@@ -9,6 +9,7 @@
 // the real turn machinery -- including the `finally` that drains -- runs without a model.
 
 import { describe, expect, it } from "vitest";
+import { alarmTime, runAlarmJob } from "./fixtures";
 import { env, RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
 import { keyString } from "@gadgets/typed-storage";
@@ -283,7 +284,7 @@ describe("durable agent calls", () => {
     expect(messages(impl).map(msg => msg.type === "agentCallback" ? msg.methodName : msg.message))
         .toEqual(["modelGone", expect.stringMatching(/Could not start.*No such model: m/)]);
     expect(impl.storage.chatMeta.get(CHAT_ID).activeAgent).toBeUndefined();
-    expect(await impl.ctx.storage.getAlarm()).toBeNull();
+    expect(await alarmTime(impl)).toBeNull();
   }));
 
   it("an unreachable user DO leaves the calls recorded, with the alarm armed to retry",
@@ -294,7 +295,7 @@ describe("durable agent calls", () => {
       get: () => ({ getChatContext: async () => { throw new Error("user DO unreachable"); } }),
     };
 
-    expect(await impl.ctx.storage.getAlarm()).toBeNull();
+    expect(await alarmTime(impl)).toBeNull();
     await deliver(impl, "retryLater", []);
     await new Promise(resolve => setTimeout(resolve, 20));
 
@@ -302,15 +303,15 @@ describe("durable agent calls", () => {
     expect(pendingCalls(impl).map(call => call.methodName)).toEqual(["retryLater"]);
     expect(messages(impl)).toEqual([]);
     // ...and a wake-up is scheduled, so the retry doesn't depend on some other event arriving.
-    expect(await impl.ctx.storage.getAlarm()).not.toBeNull();
+    expect(await alarmTime(impl)).not.toBeNull();
 
     // The alarm handler is that retry: it drains under the alarm's own retry semantics.
     fakeUsers(impl);
     impl.startAgent = () => {};
-    await instance.alarm();
+    await runAlarmJob(instance);
     expect(pendingCalls(impl)).toEqual([]);
     expect(messages(impl).map(msg => msg.type)).toEqual(["agentCallback"]);
-    expect(await impl.ctx.storage.getAlarm()).toBeNull();
+    expect(await alarmTime(impl)).toBeNull();
   }));
 
   it("the alarm handler holds the DO until a turn its own drain started has ended",
@@ -328,7 +329,7 @@ describe("durable agent calls", () => {
     impl.storage.nextAgentCallId.put(1);
 
     let settled = false;
-    let handler = instance.alarm().finally(() => { settled = true; });
+    let handler = runAlarmJob(instance).finally(() => { settled = true; });
     await waitFor(() => impl.storage.chatMeta.get(CHAT_ID).activeAgent !== undefined);
     await new Promise(resolve => setTimeout(resolve, 20));
     // No agent was running when the handler began, so a single pass would have returned here and
@@ -340,7 +341,7 @@ describe("durable agent calls", () => {
     await handler;
     expect(impl.storage.chatMeta.get(CHAT_ID).activeAgent).toBeUndefined();
     expect(messages(impl).map(msg => msg.type)).toEqual(["agentCallback", "error"]);
-    expect(await impl.ctx.storage.getAlarm()).toBeNull();
+    expect(await alarmTime(impl)).toBeNull();
   }));
 
   it("the alarm handler holds the DO across the drain between two chained turns",
@@ -376,7 +377,7 @@ describe("durable agent calls", () => {
     await waitFor(() => impl.storage.chatMeta.get(CHAT_ID).activeAgent !== undefined);
     await deliver(impl, "second", []);
     let settled = false;
-    let handler = instance.alarm().finally(() => { settled = true; });
+    let handler = runAlarmJob(instance).finally(() => { settled = true; });
 
     // A ends; its finally kicks the drain for "second", which parks on the model lookup. Nothing
     // is running, but the handler must not return: the DO would be left with a drain in flight
@@ -396,7 +397,7 @@ describe("durable agent calls", () => {
     await handler;
     expect(messages(impl).map(msg => msg.type === "agentCallback" ? msg.methodName : msg.type))
         .toEqual(["first", "error", "second", "error"]);
-    expect(await impl.ctx.storage.getAlarm()).toBeNull();
+    expect(await alarmTime(impl)).toBeNull();
   }));
 
   it("a retry that fails again re-arms a fresh keep-alive period rather than re-firing at once",
@@ -408,14 +409,14 @@ describe("durable agent calls", () => {
     };
     await deliver(impl, "stillUnreachable", []);
     await new Promise(resolve => setTimeout(resolve, 20));
-    let armedAtRecord = await impl.ctx.storage.getAlarm();
+    let armedAtRecord = await alarmTime(impl);
 
     // Nothing is set from inside the handler; one recompute at its end, from a settled state.
     await new Promise(resolve => setTimeout(resolve, 5));
-    await instance.alarm();
+    await runAlarmJob(instance);
 
     expect(pendingCalls(impl).map(call => call.methodName)).toEqual(["stillUnreachable"]);
-    let rearmed = await impl.ctx.storage.getAlarm();
+    let rearmed = await alarmTime(impl);
     // The keep-alive time is held fixed while work is outstanding, but the handler having run is
     // where a new period starts: re-using the old time would fire again immediately, forever.
     expect(rearmed).toBeGreaterThan(armedAtRecord);
@@ -441,7 +442,7 @@ describe("durable agent calls", () => {
 
     await deliver(impl, "first", []);
     await waitFor(() => impl.storage.chatMeta.get(CHAT_ID).activeAgent !== undefined);
-    let keepAliveTime = await impl.ctx.storage.getAlarm();
+    let keepAliveTime = await alarmTime(impl);
     expect(keepAliveTime).not.toBeNull();
 
     // More work arriving mid-turn recomputes the alarm but must not push that time out: it is
@@ -449,7 +450,7 @@ describe("durable agent calls", () => {
     // handler has to be running by then.
     await new Promise(resolve => setTimeout(resolve, 20));
     await deliver(impl, "second", []);
-    expect(await impl.ctx.storage.getAlarm()).toBe(keepAliveTime);
+    expect(await alarmTime(impl)).toBe(keepAliveTime);
 
     // The first turn ends, its finally drains "second", and the second turn starts (and blocks on
     // its gate). Across that whole hand-off the work was never done, so the time is unchanged.
@@ -457,19 +458,19 @@ describe("durable agent calls", () => {
     await waitFor(() => pendingCalls(impl).length === 0 &&
         messages(impl).filter(msg => msg.type === "error").length === 1);
     expect(impl.storage.chatMeta.get(CHAT_ID).activeAgent).toEqual(MODEL);
-    expect(await impl.ctx.storage.getAlarm()).toBe(keepAliveTime);
+    expect(await alarmTime(impl)).toBe(keepAliveTime);
 
     // Once no turn runs and no call is recorded, the alarm is gone...
     releases[1]();
     await waitFor(() => impl.storage.chatMeta.get(CHAT_ID).activeAgent === undefined &&
         messages(impl).filter(msg => msg.type === "error").length === 2);
-    expect(await impl.ctx.storage.getAlarm()).toBeNull();
+    expect(await alarmTime(impl)).toBeNull();
 
     // ...and the next work to become outstanding gets a fresh time, not the stale one.
     let release = gatedFakeUsers(impl);
     impl.startAgent = () => {};
     await deliver(impl, "third", []);
-    let next = await impl.ctx.storage.getAlarm();
+    let next = await alarmTime(impl);
     expect(next).not.toBeNull();
     expect(next).toBeGreaterThan(keepAliveTime);
     release();
@@ -484,12 +485,12 @@ describe("durable agent calls", () => {
 
     await deliver(impl, "armed", [], null);
     // Recorded, drain in flight: if the DO died now, only the alarm would bring it back.
-    expect(await impl.ctx.storage.getAlarm()).not.toBeNull();
+    expect(await alarmTime(impl)).not.toBeNull();
 
     release();
     await waitFor(() => pendingCalls(impl).length === 0);
     // Delivered with no turn to start (no model), so nothing needs a wake-up any more.
-    expect(await impl.ctx.storage.getAlarm()).toBeNull();
+    expect(await alarmTime(impl)).toBeNull();
   }));
 
   it("a delivered call's arguments are bound under <method>_ARGS, suffixed on collision",

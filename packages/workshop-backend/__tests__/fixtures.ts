@@ -113,3 +113,15 @@ export async function openFakeOverseer(
   } satisfies Pick<OverseerDurableObject, "open"> & { impl: object };
   return overseer.open(userId, `${userId}-profile`, new NativeRpcStub<() => void>(() => {}));
 }
+
+/** The workspace alarm job's due time, or null; lets any push or cancel in flight settle first. */
+export async function alarmTime(impl: { jobs: { get(id: string): { time: number } | undefined } })
+    : Promise<number | null> {
+  await new Promise(resolve => setTimeout(resolve, 0));
+  return impl.jobs.get("workspace-alarm")?.time ?? null;
+}
+
+/** Runs the workspace alarm job as the Lifecycle would dispatch it. */
+export function runAlarmJob(instance: { onJob(context: unknown): Promise<void> }): Promise<void> {
+  return instance.onJob({ job: { fn: "runAlarmTasks" }, attempt: 1 });
+}
