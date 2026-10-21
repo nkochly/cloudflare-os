@@ -31,6 +31,13 @@ export class ExportHandler extends WorkerEntrypoint {
 }
 `;
 
+// Code the model runs in exec sees the same draft as the file tools.
+const EXEC_CHECK = `
+import { readdir, readFile } from "node:fs/promises";
+export default async function () {
+  return { root: await readdir("."), size: (await readFile("DEALS/server.js", "utf8")).length };
+}`;
+
 function account(impl: any): JobAccount {
   let workspace = {
     listChats: async () => [...impl.storage.chatMeta.list()].map((m: any) => impl.chatMetaForClient(m)),
@@ -66,10 +73,17 @@ describe("headless job loop on Pi", () => {
             {stopReason: "toolUse"}),
         fauxAssistantMessage(fauxToolCall("write", {path: "/workspace/DEALS/server.js", content: SERVER_JS}),
             {stopReason: "toolUse"}),
+        fauxAssistantMessage(fauxToolCall("exec", {command: EXEC_CHECK}), {stopReason: "toolUse"}),
         fauxAssistantMessage(fauxText("Built the deals tracker.")),
       ]);
       await impl.piChats.runTurn(impl, {model: faux.getModel(), stream: faux.stream}, CHAT, AUTHOR,
           new AbortController().signal);
+
+      let execResult = (await impl.piChats.harness.messages({session: instance.ctx.storage.sql
+          .exec("SELECT session FROM workshop_pi_chat").one().session}))
+          .find((e: any) => e.kind === "pi.tool-result" && e.model[0].toolName === "exec");
+      expect(execResult.model[0].isError, JSON.stringify(execResult.model[0].content)).toBe(false);
+      expect(JSON.stringify(execResult.model[0].content)).toContain(`\\"size\\":${SERVER_JS.length}`);
 
       // The draft landed as the chat's own change: the gadget is provisional to the chat.
       let [meta] = await account(impl).openGadget(WS).then(ws => ws.listChats());

@@ -10203,7 +10203,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
-    this.piChats = new PiChats(ctx);
+    this.piChats = new PiChats(ctx, env.LOADER);
     this.lifecycle = Lifecycle.install(this).use(this.piChats.harness);
     // Native RPC bypasses the Lifecycle's automatic startup, and the impl reads the job queue as it
     // recovers, so start it here; the impl's own blockConcurrencyWhile runs after this one.

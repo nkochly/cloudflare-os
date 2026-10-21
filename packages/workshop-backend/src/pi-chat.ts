@@ -1,4 +1,5 @@
 import { Workspace } from "@cloudflare/computer";
+import { WorkerJavaScriptBackend } from "@cloudflare/computer/backends/worker-javascript";
 import { createPiTools, type PiTool } from "@cloudflare/computer/tools/pi-ai";
 import { Type, type Api, type Model } from "@earendil-works/pi-ai";
 import { createModels, createProvider } from "@earendil-works/pi-ai/models";
@@ -71,7 +72,13 @@ export class PiChats {
   readonly #sql: SqlStorage;
   readonly #models = createModels();
 
-  constructor(ctx: DurableObjectState) {
+  readonly #storage: DurableObjectStorage;
+  readonly #loader: WorkerLoader | undefined;
+  readonly #chatWorkspaces = new Map<number, Workspace>();
+
+  constructor(ctx: DurableObjectState, loader?: WorkerLoader) {
+    this.#storage = ctx.storage;
+    this.#loader = loader;
     this.#sql = ctx.storage.sql;
     this.#sql.exec(`CREATE TABLE IF NOT EXISTS workshop_pi_chat (
       chat_id INTEGER PRIMARY KEY, session TEXT NOT NULL, synced_sequence INTEGER NOT NULL)`);
@@ -231,6 +238,23 @@ export class PiChats {
     return files;
   }
 
+  /**
+   * The chat's draft as its own Workspace, for `exec`: a JavaScript module runs in a fresh Dynamic
+   * Worker (computer's WorkerJavaScriptBackend) with `node:fs` rooted at the draft folder, so code
+   * the model runs sees and changes exactly the files the file tools do. It has no network.
+   */
+  #execWorkspace(chatId: number): Workspace | undefined {
+    if (!this.#loader) return undefined;
+    let ws = this.#chatWorkspaces.get(chatId);
+    if (!ws) {
+      ws = new Workspace({storage: this.#storage, output: false, backends: [new WorkerJavaScriptBackend({
+        loader: this.#loader as never, root: PiChats.folder(chatId), globalOutbound: null,
+      })]});
+      this.#chatWorkspaces.set(chatId, ws);
+    }
+    return ws;
+  }
+
   #chatOf(session: string): number {
     let row = this.#sql.exec<{chat_id: number}>(
         "SELECT chat_id FROM workshop_pi_chat WHERE session = ?", session).toArray()[0];
@@ -282,6 +306,29 @@ export class PiChats {
       },
     };
 
+    // The exec tool is declared once; each call runs on the calling chat's own backend.
+    let execDeclaration = this.#loader && createPiTools({workspace: this.#execWorkspace(0)!,
+      exec: {"worker-javascript": {}}}).tools.find(tool => tool.name === "exec");
+    let exec: ToolRegistration[] = !this.#loader || !execDeclaration ? [] : [{
+      name: "exec",
+      description: execDeclaration.description,
+      parameters: execDeclaration.parameters as never,
+      execute: async (args, api, context) => {
+        // Code runs in the draft folder: relative paths name the same files the file tools show
+        // under /workspace.
+        let root = PiChats.folder(this.#chatOf(String(api.conversationId)));
+        let call = {...args as Record<string, unknown>};
+        let cwd = typeof call.cwd === "string" ? call.cwd.replace(/^\/workspace(?=\/|$)/, "") : "";
+        call.cwd = root + (cwd && !cwd.startsWith("/") ? `/${cwd}` : cwd);
+        let result = await createPiTools({workspace: this.#execWorkspace(Number(root.split("/").at(-1)))!,
+          exec: {"worker-javascript": {}}})
+            .execute({id: api.callId, name: "exec", arguments: call}, {abortSignal: context.abortSignal});
+        let content = result.content.map(c => c.type === "text" ? {...c, text: c.text.replaceAll(root, WORKSPACE)} : c);
+        if (result.isError) throw new Error(content.map(c => c.type === "text" ? c.text : "").join("\n"));
+        return {output: content};
+      },
+    }];
+
     return defineExtension({
       name: "workshop",
       sections: [section("workshop", () => [
@@ -289,8 +336,9 @@ export class PiChats {
         "exporting a Durable Object class Gadget and, for exports, a WorkerEntrypoint ExportHandler.",
         "Create a gadget with createGadget, then write its files under /workspace/<bindingName>/.",
         "Existing gadgets are the other folders in /workspace.",
+        "Code you run with exec starts in /workspace: use relative paths there, e.g. DEALS/server.js.",
       ].join("\n"))],
-      tools: [...fileTools, createGadget as unknown as ToolRegistration],
+      tools: [...fileTools, ...exec, createGadget as unknown as ToolRegistration],
     });
   }
 }
