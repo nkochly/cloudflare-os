@@ -54,7 +54,7 @@ async function withClient(fn: (impl: any, client: Overseer) => Promise<void>): P
   let stub = env.TEST_OVERSEER.getByName(`worktrees-${++doCounter}`);
   await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
     let impl = (instance as unknown as { impl: any }).impl;
-    let ownerId = impl.users.newUniqueId().toString();
+    let ownerId = crypto.randomUUID();
     impl.ownerId = ownerId;
     impl.ensureAmbientCapsules = async () => {};
     impl.markOutputsDirty = () => {};

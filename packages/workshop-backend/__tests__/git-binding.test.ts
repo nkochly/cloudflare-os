@@ -30,7 +30,7 @@ async function withImpl(
     let impl = (instance as unknown as { impl: any }).impl;
     impl.ownerId = "owner-user-do";
     impl.users = {
-      idFromString: (id: string) => id,
+      idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
       idFromName: (name: string) => name,
       get: () => ({ whoami: async () => ownerProfile }),
     };
@@ -393,7 +393,7 @@ describe("env.GIT presence", () => {
     let stub = env.TEST_OVERSEER.getByName(`git-binding-${++doCounter}`);
     await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
       let impl = (instance as unknown as { impl: any }).impl;
-      let ownerId = impl.users.newUniqueId().toString();
+      let ownerId = crypto.randomUUID();
       impl.ownerId = ownerId;
       impl.ensureAmbientCapsules = async () => {};
       impl.markOutputsDirty = () => {};

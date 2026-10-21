@@ -36,7 +36,7 @@ async function withImpl(fn: (impl: any) => Promise<void>): Promise<void> {
     let impl = (instance as unknown as { impl: any }).impl;
     impl.ownerId = OWNER_USER_ID;
     impl.users = {
-      idFromString: (id: string) => id,
+      idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
       get: () => ({ getChatContext: async () => ({ profile: OWNER }) }),
     };
     // The turn is driven by hand below, not by the spawn.
@@ -65,7 +65,7 @@ async function commitFiles(impl: any, files: Record<string, string>): Promise<st
 // Spawns a chat through the spawner binding a gadget would hold, returning its chat id.
 async function spawnChat(impl: any, config: AgentSpawnerConfig): Promise<number> {
   let cls = impl.ctx.exports.AgentSpawnerGatekeeper({ props: {
-    overseerId: impl.ctx.id.toString(), config, creatorUserId: OWNER_USER_ID,
+    overseerId: impl.ctx.id.name!, config, creatorUserId: OWNER_USER_ID,
   } });
   let facet = await impl.getGatekeeperFacet(900, cls);
   let binding: AgentSpawnerBinding = await facet.startSession(undefined);

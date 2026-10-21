@@ -57,7 +57,7 @@ function seedChat(impl: any): void {
 // for a model, the broken one above.
 function fakeUsers(impl: any): void {
   impl.users = {
-    idFromString: (id: string) => id,
+    idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
     get: () => ({
       getChatContext: async (modelId: string | null) => ({
         profile: OWNER,
@@ -122,7 +122,7 @@ const SPAWNER_TYPES = {
 // then its session. Calls made through it go over RPC back into the overseer.
 async function spawnerBinding(impl: any, config = SPAWNER_CONFIG): Promise<AgentSpawnerBinding> {
   let cls = impl.ctx.exports.AgentSpawnerGatekeeper({ props: {
-    overseerId: impl.ctx.id.toString(), config, creatorUserId: OWNER_USER_ID,
+    overseerId: impl.ctx.id.name!, config, creatorUserId: OWNER_USER_ID,
   } });
   return (await impl.getGatekeeperFacet(900, cls)).startSession(undefined);
 }
@@ -268,7 +268,7 @@ describe("durable agent calls", () => {
       () => freshImpl(async impl => {
     seedChat(impl);
     impl.users = {
-      idFromString: (id: string) => id,
+      idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
       get: () => ({ getChatContext: async (modelId: string | null) => {
         if (modelId) throw new Error(`No such model: ${modelId}`);
         return { profile: OWNER };
@@ -291,7 +291,7 @@ describe("durable agent calls", () => {
       () => freshImpl(async (impl, instance) => {
     seedChat(impl);
     impl.users = {
-      idFromString: (id: string) => id,
+      idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
       get: () => ({ getChatContext: async () => { throw new Error("user DO unreachable"); } }),
     };
 
@@ -404,7 +404,7 @@ describe("durable agent calls", () => {
       () => freshImpl(async (impl, instance) => {
     seedChat(impl);
     impl.users = {
-      idFromString: (id: string) => id,
+      idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
       get: () => ({ getChatContext: async () => { throw new Error("user DO unreachable"); } }),
     };
     await deliver(impl, "stillUnreachable", []);
@@ -620,7 +620,7 @@ describe("durable agent calls", () => {
       seedChat(impl);
       // The real user DO answers the drain after the restart (its default profile, no model), so
       // the record must name a genuine id in its namespace.
-      userId = impl.users.newUniqueId().toString();
+      userId = crypto.randomUUID();
       impl.storage.pendingAgentCalls.put({
         chatId: CHAT_ID, callId: 0, methodName: "survivor", args: [7], argsSummary: "[7]",
         initiatorUserId: userId, initiatorModelId: null,
@@ -645,7 +645,7 @@ describe("durable agent calls", () => {
     let name = `agent-calls-unresumable-${++doCounter}`;
     await withImpl(name, async impl => {
       seedChat(impl);
-      let userId = impl.users.newUniqueId().toString();
+      let userId = crypto.randomUUID();
       // A turn interrupted by the restart, whose model the real user DO no longer knows...
       impl.storage.chatMeta.put({ ...impl.storage.chatMeta.get(CHAT_ID), activeAgent: MODEL });
       impl.storage.activeAgents.put({

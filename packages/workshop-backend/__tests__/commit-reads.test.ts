@@ -87,7 +87,7 @@ describe("listChangedPaths over the Overseer interface", () => {
     let stub = env.TEST_OVERSEER.getByName(`commit-reads-${++doCounter}`);
     await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
       let impl = (instance as unknown as { impl: any }).impl;
-      let ownerId = impl.users.newUniqueId().toString();
+      let ownerId = crypto.randomUUID();
       impl.ownerId = ownerId;
       impl.ensureAmbientCapsules = async () => {};
       impl.markOutputsDirty = () => {};

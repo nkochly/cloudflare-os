@@ -47,7 +47,7 @@ describe("startJob", () => {
       "me@x.com",
       name => (names.push(name), {receiveExternalMessage: receive}),
     );
-    expect(names).toEqual([jobWorkspaceName("pipeline")]);
+    expect(names).toEqual([await jobWorkspaceName("pipeline")]);
     expect(receive.mock.calls[0][0]).toMatchObject({
       callerEmail: "me@x.com", externalChatKey: "owner:app:pipeline", idempotencyKey: "owner:job:j1",
     });

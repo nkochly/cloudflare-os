@@ -91,7 +91,7 @@ async function scenario(kind: Kind = "connection", active = false, initiator: Ai
     impl.addChatMessages(CHAT, USER, [{type: "message", message: "Do the work"}]);
     request(impl, kind);
     impl.storage.activeAgents.put({chatId: CHAT, modelId: MODEL.profile.id,
-      initiatorUserId: user.id.toString(), initiator, callbackInitiated: initiator.type === "gadget"});
+      initiatorUserId: user.id.name!, initiator, callbackInitiated: initiator.type === "gadget"});
   });
   return {stub, user, visit};
 }
@@ -99,7 +99,7 @@ async function scenario(kind: Kind = "connection", active = false, initiator: Ai
 function decisionClient(impl: Impl, profile = USER, overrides: object = {}) {
   const userId = impl.storage.activeAgents.get(CHAT)?.initiatorUserId;
   return openFakeOverseer(impl.storage, {impl: {
-    users: {idFromString: (id: string) => id,
+    users: {idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
       get: (id: string) => ({id: {toString: () => userId ?? id}, whoami: async () => profile,
         getChatContext: async () => ({profile: USER, aiModel: MODEL})})},
     rememberDecisionInitiator: impl.rememberDecisionInitiator.bind(impl),
@@ -116,7 +116,7 @@ function decisionClient(impl: Impl, profile = USER, overrides: object = {}) {
 
 function modelLookup(impl: Impl, lookup: () => Promise<{profile: typeof USER, aiModel: typeof MODEL}>) {
   // Hold/fail the caller-side read, without an unrelated user-DO RPC keeping an eviction alive.
-  impl.users = {idFromString: (id: string) => id,
+  impl.users = {idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
     get: () => ({getChatContext: lookup, publishNotification: async () => {}})} as
       unknown as typeof impl.users;
 }
@@ -124,7 +124,7 @@ function modelLookup(impl: Impl, lookup: () => Promise<{profile: typeof USER, ai
 function recordNotifications() {
   const notifications: [string, UserNotification][] = [];
   vi.spyOn(UserDurableObject.prototype, "publishNotification").mockImplementation(async function(notification) {
-    notifications.push([this.ctx.id.toString(), notification]);
+    notifications.push([this.ctx.id.name!, notification]);
   });
   return notifications;
 }
@@ -161,7 +161,7 @@ describe("decision handoff using the existing execution row", () => {
       using client = await decisionClient(impl);
       await client.acceptConnectionRequest("1:connection", {gatekeeperId: 31});
       expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toEqual(MODEL.profile);
-      expect(impl.storage.activeAgents.get(CHAT)?.initiatorUserId).toBe(s.user.id.toString());
+      expect(impl.storage.activeAgents.get(CHAT)?.initiatorUserId).toBe(s.user.id.name!);
       expect(await alarmTime(impl)).not.toBeNull();
       expect([...impl.storage.chats.list()].filter(m => m.type === "agentNudge")).toHaveLength(1);
       await impl.ctx.storage.sync();
@@ -262,7 +262,7 @@ describe("decision handoff using the existing execution row", () => {
       await client.acceptConnectionRequest("1:connection", {gatekeeperId: 31});
       const record = impl.storage.activeAgents.get(CHAT)!;
       expect(record.initiator).toEqual(legacy ? approver : USER);
-      expect(record.initiatorUserId).toBe(legacy ? "owner-id" : s.user.id.toString());
+      expect(record.initiatorUserId).toBe(legacy ? "owner-id" : s.user.id.name!);
       gate.resolve();
       await impl.waitForAllAgentsToComplete();
     });
@@ -298,7 +298,7 @@ describe("decision handoff using the existing execution row", () => {
       impl.storage.chatMeta.put({...meta, activeAgent: successor.profile});
       vi.spyOn(impl, "reconcilePendingGadgets").mockImplementationOnce(() => setup.promise);
       const errors = vi.spyOn(impl.logger, "error");
-      impl.startAgent(CHAT, successor, USER, s.user.id.toString());
+      impl.startAgent(CHAT, successor, USER, s.user.id.name!);
       gate.resolve();
       await vi.waitFor(() => expect(errors).toHaveBeenCalled());
       expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toEqual(successor.profile);
@@ -324,12 +324,12 @@ describe("decision handoff using the existing execution row", () => {
       await s.visit(async impl => {
         await impl.waitForAllAgentsToComplete();
         expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
-        expect(impl.storage.activeAgents.get(CHAT)?.initiatorUserId).toBe(s.user.id.toString());
+        expect(impl.storage.activeAgents.get(CHAT)?.initiatorUserId).toBe(s.user.id.name!);
         expect(await alarmTime(impl)).toBeNull();
       });
     }
-    await vi.waitFor(() => expect(notifications).toEqual([[s.user.id.toString(), expect.objectContaining({
-      kind: "permissionRequested", workspaceId: s.stub.id.toString(), chatId: CHAT, chatTitle: "Resume",
+    await vi.waitFor(() => expect(notifications).toEqual([[s.user.id.name!, expect.objectContaining({
+      kind: "permissionRequested", workspaceId: s.stub.id.name!, chatId: CHAT, chatTitle: "Resume",
     })]]));
     expect(requests()).toBe(0);
   });
@@ -352,8 +352,8 @@ describe("decision handoff using the existing execution row", () => {
       }));
     });
     if (initiator.type === "user") {
-      await vi.waitFor(() => expect(notifications).toEqual([[s.user.id.toString(), expect.objectContaining({
-        kind: "taskCompleted", workspaceId: s.stub.id.toString(), chatId: CHAT, chatTitle: "Resume",
+      await vi.waitFor(() => expect(notifications).toEqual([[s.user.id.name!, expect.objectContaining({
+        kind: "taskCompleted", workspaceId: s.stub.id.name!, chatId: CHAT, chatTitle: "Resume",
       })]]));
     } else {
       expect(notifications).toEqual([]);

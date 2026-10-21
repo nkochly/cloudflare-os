@@ -252,7 +252,7 @@ describe("LoginConnectCallbackImpl", () => {
     // the account must be able to reconnect and be marked expired like one connected the usual way.
     const pending = fresh();
     const userStub = env.TEST_USER.getByName("login-callback-linked");
-    await pending.link(userStub.id.toString(), 0);
+    await pending.link(userStub.id.name!, 0);
     const pendingId = pending.id.toString();
     await runInDurableObject(userStub, async (instance: UserDurableObject) => {
       const user = instance as UserInternals;

@@ -97,7 +97,7 @@ async function instantiate(blueprintId: string, metadata: BlueprintMetadata)
       setGadgetLastActive: async () => {},
     };
     impl.ownerId = "owner-user-do";
-    impl.users = { idFromString: (id: string) => id, get: () => owner };
+    impl.users = { idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); }, get: () => owner };
     impl.markOutputsDirty = () => {};  // would sync the new gadget's format to the owner
 
     await instance.initializeFromBlueprint(blueprintId, metadata, metadata.output);

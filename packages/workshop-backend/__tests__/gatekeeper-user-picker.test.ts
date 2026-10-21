@@ -147,24 +147,10 @@ describe("gatekeeper user picker selection tickets", () => {
     await expect(env.TEST_USER.getByName(missing).whoamiIfExists()).resolves.toBeNull();
   });
 
-  it("refuses self-selection after the selector cold-starts through its serialized ID", async () => {
+  it("refuses to start when addressed by id string instead of by name", async () => {
     const viewer = uniqueUser("view");
-    const viewerId = env.TEST_USER.idFromName(viewer);
-    const user = env.TEST_USER.get(env.TEST_USER.idFromString(viewerId.toString()));
-    // Start through idFromString before any named access so this instance has no ctx.id.name.
-    await user.authenticateFromCfAccess(viewer, true);
-    await installAdminConfig(viewer);
-    const testHooks = hooks();
-    const appAccount = await testHooks.addAccount(viewer, "context", `${viewer}-context`, { providesUi: true });
-    await inUser(viewer, instance => {
-      expect(instance.ctx.id.name).toBeUndefined();
-    });
-
-    // The subsequent named mint must still recognize the caller and leave no redeemable ticket.
-    await expect(testHooks.pick(viewer, appAccount, viewer)).resolves.toBeNull();
-    await inUser(viewer, instance => {
-      expect(Array.from(instance.storage.pendingUserSelections.list())).toEqual([]);
-    });
+    const user = env.TEST_USER.get(env.TEST_USER.idFromString(env.TEST_USER.idFromName(viewer).toString()));
+    await expect(user.authenticateFromCfAccess(viewer, true)).rejects.toThrow(/Durable Object name/);
   });
 
   it("refuses disabled, missing and non-UI selector apps", async () => {

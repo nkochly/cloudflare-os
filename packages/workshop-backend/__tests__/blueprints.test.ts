@@ -103,7 +103,7 @@ async function withWorkspace(fn: (workspace: Workspace) => Promise<void>): Promi
       deleteBlueprint: async () => {},
       setGadgetLastActive: async () => {},
     };
-    impl.users = { idFromString: (id: string) => id, get: () => owner };
+    impl.users = { idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); }, get: () => owner };
     // Disposed with the session: the session holds a duplicate of the stub until then.
     using notifyClosed = new NativeRpcStub<() => void>(() => {});
     using client = await instance.open(OWNER_USER_ID, OWNER.id, notifyClosed);
@@ -543,7 +543,7 @@ describe("publishing a blueprint", () => {
     let metadata = metadataFor("Orphan", { version: 2, commitId: "a".repeat(40) });
     await env.BLUEPRINT_CONTENT.put("orphan/1", await snapshotContent(V1));
     await env.BLUEPRINT_CONTENT.put(blueprintContentKey("orphan", metadata), "pack");
-    kv.set("orphan", JSON.stringify({ metadata, ownerId: stub.id.toString() }));
+    kv.set("orphan", JSON.stringify({ metadata, ownerId: stub.id.name! }));
 
     await runInDurableObject(stub, async (user: UserDurableObject) => {
       let internals = user as unknown as { env: Cloudflare.Env };

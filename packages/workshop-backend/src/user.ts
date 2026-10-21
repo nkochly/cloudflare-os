@@ -25,7 +25,6 @@ import {
   DEVICE_HANDOFF_LIFETIME_MS, isDeviceHandoffState, sealDeviceSessionHandoff,
   type DeviceSessionCredential, type DeviceSessionHandoff,
 } from "./auth/device-session-handoff.js";
-import { startLifecycle } from "./lifecycle-name";
 import { Lifecycle, type LifecycleJobContext } from "agents/lifecycle";
 
 const logger = createWorkshopLogger("workshop.user");
@@ -218,7 +217,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     super(ctx, env);
     this.lifecycle = Lifecycle.install(this);
     // Native RPC bypasses the Lifecycle's automatic startup; the sweep job is pushed from RPCs.
-    ctx.blockConcurrencyWhile(() => startLifecycle(ctx, this.lifecycle));
+    ctx.blockConcurrencyWhile(() => this.lifecycle.start());
 
     this.storage = makeUserStorage(ctx.storage);
     this.adminSettings = this.ctx.exports.AdminSettings;
@@ -325,7 +324,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       // Reissue only the one-use ticket; a retry must not mint another credential or session.
       const { secret, hash: ticketHash } = await newSecretToken();
       this.storage.pendingDeviceHandoffs.put({ ...existing, ticketHash });
-      return { userDoId: this.ctx.id.toString(), ticket: secret.toHex() };
+      return { userDoId: this.ctx.id.name!, ticket: secret.toHex() };
     }
     if (existing) this.#dropPendingDeviceHandoff(existing);
 
@@ -370,7 +369,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       event: "auth.device_handoff.staged",
       credentialKind: credential.kind,
     });
-    return { userDoId: this.ctx.id.toString(), ticket: ticket.toHex() };
+    return { userDoId: this.ctx.id.name!, ticket: ticket.toHex() };
   }
 
   /** Consume a staged handoff once and activate its pending Workshop device session, if any. */
@@ -1021,10 +1020,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
     let done = examined < OUTPUTS_BACKFILL_PAGE;
 
-    let ownerId = this.ctx.id.toString();
+    let ownerId = this.ctx.id.name!;
     let overseers = this.ctx.exports.OverseerDurableObject;
     let results = await Promise.allSettled(targets.map(id =>
-        overseers.get(overseers.idFromString(id)).getOutputsForOwnerBackfill(ownerId)));
+        overseers.getByName(id).getOutputsForOwnerBackfill(ownerId)));
 
     let failureCount = 0;
     let firstError: unknown;
@@ -1179,7 +1178,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     if (kvRecord) {
-      if (kvRecord.ownerId !== this.ctx.id.toString()) {
+      if (kvRecord.ownerId !== this.ctx.id.name) {
         throw new Error("You don't own this blueprint.");
       }
 
@@ -1336,7 +1335,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.nextAccountId.put(accountId + 1);
 
     let props = {
-      userId: this.ctx.id.toString(),
+      userId: this.ctx.id.name!,
       accountId,
       vendorId,
     };
@@ -1553,7 +1552,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record?.description.providesUi) throw new Error("No such app.");
     let userSelectionExchange = this.ctx.exports.GatekeeperUserSelectionExchangeImpl({
-      props: { selectorUserId: this.ctx.id.toString(), appAccountId: accountId },
+      props: { selectorUserId: this.ctx.id.name!, appAccountId: accountId },
     });
     return (record.account as unknown as SingletonAccountStub)
         .startAppUi({ isAdmin: options.isAdmin, userSelectionExchange });
@@ -1578,8 +1577,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
    * redeemable through that gatekeeper app's exchange capability (see
    * GatekeeperUserSelectionExchangeImpl). Returns null if the selected user is
-   * this user or does not exist. Self-selection uses stable DO identity because
-   * ctx.id.name may be absent after a cold start through idFromString().
+   * this user or does not exist.
    */
   async createGatekeeperUserSelection(
       appAccountId: number, selectedUserId: string,
@@ -2307,8 +2305,7 @@ export class GatekeeperConnectCallbackImpl
     extends WorkerEntrypoint<Cloudflare.Env, GatekeeperConnectCallbackProps>
     implements GatekeeperConnectCallback {
   #getUserStub() {
-    let userId = this.ctx.exports.UserDurableObject.idFromString(this.ctx.props.userId);
-    return this.ctx.exports.UserDurableObject.get(userId);
+    return this.ctx.exports.UserDurableObject.getByName(this.ctx.props.userId);
   }
 
   complete(account: Fetcher<GatekeeperUser>, expiresAt?: Date): Promise<ConnectHandoff> {
@@ -2357,7 +2354,7 @@ export class GatekeeperUserSelectionExchangeImpl
   redeem(ticket: string): Promise<RedeemedGatekeeperUserSelection[]> {
     let { selectorUserId, appAccountId } = this.ctx.props;
     let users = this.ctx.exports.UserDurableObject;
-    return users.get(users.idFromString(selectorUserId))
+    return users.getByName(selectorUserId)
         .redeemGatekeeperUserSelection(appAccountId, ticket);
   }
 }

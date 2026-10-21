@@ -389,7 +389,7 @@ describe("connect handoff", () => {
     const handoff = await inDo(async user => {
       user.storage.nextAccountId.put(1);
       const callback = user.ctx.exports.TestConnectCallback({
-        props: { userId: user.ctx.id.toString(), accountId: 0, vendorId: "github" },
+        props: { userId: user.ctx.id.name!, accountId: 0, vendorId: "github" },
       });
       const staged = await callback.complete(fakeAccount(user, "via-callback").account);
       expect(user.storage.connectedAccounts.get(0)).toBeUndefined();
@@ -402,7 +402,7 @@ describe("connect handoff", () => {
       expect(user.storage.connectedAccounts.get(0)?.vendorId).toBe("github");
       // A reconnect finishing on the same callback stages a restore, not a second account.
       const callback = user.ctx.exports.TestConnectCallback({
-        props: { userId: user.ctx.id.toString(), accountId: 0, vendorId: "github" },
+        props: { userId: user.ctx.id.name!, accountId: 0, vendorId: "github" },
       });
       await callback.reconnectComplete(STAGE_ID);
       expect(pendingCount(user)).toBe(1);

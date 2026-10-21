@@ -900,7 +900,7 @@ describe("gadget facet stubs count as sessions", () => {
       getGadgetFacet: (id: number, chatId?: number, joinAs?: string) =>
           impl.getGadgetFacet(id, chatId, joinAs),
       recordGadgetAnalytics: () => {},
-      users: { idFromString: (id: string) => id,
+      users: { idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
                get: () => ({
                  id: { toString: () => "viewer-user-do" },
                  whoami: async () => ({ type: "user", id: "viewer", name: "Viewer" }),

@@ -9,7 +9,6 @@ import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
 } from "cloudflare:workers";
-import { startLifecycle } from "./lifecycle-name";
 import { Lifecycle, type LifecycleJobContext, type LifecycleJobs } from "agents/lifecycle";
 import { keyString } from "@gadgets/typed-storage";
 import type { ListOptions } from "@gadgets/typed-storage";
@@ -1113,11 +1112,10 @@ class OverseerImpl implements AgentHooks {
     let leaveSession = () => {};
     using _resumeSession = {[Symbol.dispose]: () => leaveSession()};
     try {
-      let userMeta = await retryOnDoReset(() => this.users.get(
-          this.users.idFromString(record.initiatorUserId)).getChatContext(record.modelId), this.logger);
+      let userMeta = await retryOnDoReset(() => this.users.getByName(record.initiatorUserId).getChatContext(record.modelId), this.logger);
       aiModel = userMeta.aiModel;
       if (this.ownerId && record.initiator.type === "user" && record.initiatorUserId !== this.ownerId) {
-        let user = this.users.get(this.users.idFromString(record.initiatorUserId));
+        let user = this.users.getByName(record.initiatorUserId);
         if (!await this.authorizeCollaborator(record.initiator.id, user, {requireRole: "build"})) {
           throw new Error("The original initiator no longer has build access to this workspace.");
         }
@@ -1204,7 +1202,7 @@ class OverseerImpl implements AgentHooks {
 
   constructor(public ctx: DurableObjectState, public env: Cloudflare.Env,
               private readonly jobs: LifecycleJobs) {
-    this.logger = logger.with({ gadgetId: ctx.id.toString() });
+    this.logger = logger.with({ gadgetId: ctx.id.name! });
     this.storage = makeOverseerStorage(ctx.storage);
     this.gitStore = new GitStore(this.storage.gitObjects);
     this.gitCache = new WorkspaceGitCache(this.storage, {
@@ -1936,7 +1934,7 @@ class OverseerImpl implements AgentHooks {
   recordGadgetAnalytics(event: ProductAnalyticsGadgetInput): void {
     recordAnalytics(this.ctx, this.env, {
       ...event,
-      gadget_id: this.ctx.id.toString(),
+      gadget_id: this.ctx.id.name!,
       gadget_owner_user_id: this.ownerId,
     });
   }
@@ -2541,7 +2539,7 @@ class OverseerImpl implements AgentHooks {
 
   makeBindingLoopback(target: BindingLoopbackTarget, caller: GatekeeperCaller) {
     let props: GatekeeperLoopbackProps = {
-      overseerId: this.ctx.id.toString(),
+      overseerId: this.ctx.id.name!,
       target,
       caller,
     };
@@ -4490,7 +4488,7 @@ class OverseerImpl implements AgentHooks {
       codeVersion += `.${chatId}.${sequence}`;
     }
 
-    return this.env.LOADER.get(`${this.ctx.id}.${codeVersion}.${gadgetId}`, async () => {
+    return this.env.LOADER.get(`${this.ctx.id.name}.${codeVersion}.${gadgetId}`, async () => {
       // The snapshot meta above serves the as-of-`sequence` doc build; this re-read only keeps
       // the old fail-on-deleted-chat behavior (don't cache a load for a chat deleted mid-load).
       if (chatId !== undefined) this.getChatMetaOrThrow(chatId);
@@ -4520,7 +4518,7 @@ class OverseerImpl implements AgentHooks {
       let tailProps: GadgetTailLoopbackProps = {
         chatId,
         gadgetId,
-        overseerId: this.ctx.id.toString(),
+        overseerId: this.ctx.id.name!,
       };
 
       return {
@@ -4968,7 +4966,7 @@ class OverseerImpl implements AgentHooks {
   traceAgentActionApproval(record: ActionRecord, state: "requested" | "approved" | "denied") {
     if (record.caller.from !== "agent") return;
     let chatId = record.caller.chatId;
-    traceToolApproval(this.getChatAgentContext(chatId), this.ctx.id.toString(), chatId,
+    traceToolApproval(this.getChatAgentContext(chatId), this.ctx.id.name!, chatId,
         gatekeeperVendorId(this.storage.gatekeepers.get(record.gatekeeperId)), state);
   }
 
@@ -5246,7 +5244,7 @@ class OverseerImpl implements AgentHooks {
       if (caller.from === "agent") {
         this.#getOrCreateCapturedActions(caller.chatId).actions.push(actionId);
       } else if (caller.from !== "hook" && caller.chatId !== undefined && this.ownerId) {
-        let owner = this.users.get(this.users.idFromString(this.ownerId));
+        let owner = this.users.getByName(this.ownerId);
         let userMeta = await owner.getChatContext(null);
         this.addChatMessages(caller.chatId, this.gadgetAuthorFor(userMeta.profile),
                              [{type: "action", actionId}]);
@@ -6025,15 +6023,15 @@ class OverseerImpl implements AgentHooks {
         return;
       }
 
-      let owner = this.users.get(this.users.idFromString(this.ownerId));
+      let owner = this.users.getByName(this.ownerId);
 
       this.#lastActiveTimeKnownToUserDo = this.#lastActiveTimeKnownToUs!;
-      await owner.setGadgetLastActive(this.ctx.id.toString(), this.#lastActiveTimeKnownToUs!,
+      await owner.setGadgetLastActive(this.ctx.id.name!, this.#lastActiveTimeKnownToUs!,
                                       this.storage.totalCost.get());
     } catch (err) {
       this.logger.warn("failed to bump gadget last-active on user DO", {
         event: "gadget.last.active.bump.failed",
-        gadgetId: this.ctx.id.toString(), error: err,
+        gadgetId: this.ctx.id.name!, error: err,
       });
       this.restartIfLoopLimited(err);
 
@@ -6109,11 +6107,11 @@ class OverseerImpl implements AgentHooks {
   async syncOutputsTo(user: DurableObjectStub<UserDurableObject>,
                       snapshot = this.outputsSnapshot()): Promise<boolean> {
     try {
-      await user.syncWorkspaceOutputs(this.ctx.id.toString(), snapshot);
+      await user.syncWorkspaceOutputs(this.ctx.id.name!, snapshot);
       return true;
     } catch (err) {
       this.logger.warn("failed to sync workspace outputs to user DO", {
-        event: "workspace.outputs.sync.failed", gadgetId: this.ctx.id.toString(), error: err,
+        event: "workspace.outputs.sync.failed", gadgetId: this.ctx.id.name!, error: err,
       });
       this.restartIfLoopLimited(err);
       return false;
@@ -6130,7 +6128,7 @@ class OverseerImpl implements AgentHooks {
       return this.#syncOutputsToWatchers();
     }).catch(err => {
       this.logger.warn("failed to flush workspace outputs", {
-        event: "workspace.outputs.flush.failed", gadgetId: this.ctx.id.toString(), error: err,
+        event: "workspace.outputs.flush.failed", gadgetId: this.ctx.id.name!, error: err,
       });
     });
   }
@@ -6156,7 +6154,7 @@ class OverseerImpl implements AgentHooks {
 
     let userIds = new Set([ownerId, ...this.#connectedIndexes.keys()]);
     let delivered = await Promise.all([...userIds].map(
-        userId => this.syncOutputsTo(this.users.get(this.users.idFromString(userId)), snapshot)));
+        userId => this.syncOutputsTo(this.users.getByName(userId), snapshot)));
 
     // Recorded only once every index has it, so that a recipient this failed for is included in
     // the next flush instead of being remembered as up to date. If nothing changes again, their
@@ -7174,7 +7172,7 @@ class OverseerImpl implements AgentHooks {
                 liveChat: LiveChatContext): Promise<void> {
     return obsContext.with({
       operation: "agent.run",
-      gadgetId: this.ctx.id.toString(),
+      gadgetId: this.ctx.id.name!,
       chatId,
       modelId: aiModel.profile.id,
     }, () => this.#runAgentTurnWithContext(
@@ -7231,7 +7229,7 @@ class OverseerImpl implements AgentHooks {
         // emits a stream "clear" — otherwise the UI would spin forever on a block.)
         let byokRouting: UserGatewayRouting | undefined;
         if (this.ownerId) {
-          let ownerStub = this.users.get(this.users.idFromString(this.ownerId));
+          let ownerStub = this.users.getByName(this.ownerId);
           let usage = await checkUsageAndBalance(this.env, ownerStub);
           if (!usage.allowed) {
             turn.setErrorType("usage_limit");
@@ -7252,12 +7250,12 @@ class OverseerImpl implements AgentHooks {
           }
         }
 
-        let sessionAffinity = await computeSessionAffinity(this.ctx.id.toString(), chatId);
+        let sessionAffinity = await computeSessionAffinity(this.ctx.id.name!, chatId);
         let chosenModel = getModel(
             this.env, aiModel.config, initiator, {
               sessionAffinity,
               userGateway: byokRouting,
-              metadata: { source: "chat", gadgetId: this.ctx.id.toString(), chatId },
+              metadata: { source: "chat", gadgetId: this.ctx.id.name!, chatId },
             });
         turn.setModel(chosenModel.model);
 
@@ -7468,7 +7466,7 @@ class OverseerImpl implements AgentHooks {
       // so a human sees them and the alarm isn't retrying forever. For that we need the profile
       // alone; if even that fails, the user DO itself is the problem, which is transient -- the
       // calls stay recorded and the alarm retries.
-      let user = this.wrapUserDo(this.users.get(this.users.idFromString(first.initiatorUserId)));
+      let user = this.wrapUserDo(this.users.getByName(first.initiatorUserId));
       let userMeta: UserChatContext;
       let modelError: unknown;
       try {
@@ -7598,7 +7596,7 @@ class OverseerImpl implements AgentHooks {
   // A fresh stub to the workspace owner's user DO.
   ownerUserDo() {
     if (!this.ownerId) throw new Error("Workspace is not initialized.");
-    return this.wrapUserDo(this.users.get(this.users.idFromString(this.ownerId)));
+    return this.wrapUserDo(this.users.getByName(this.ownerId));
   }
 
   // Ensure every singleton account the gadget owner has (e.g. the Context Library) is provisioned
@@ -8116,7 +8114,7 @@ class OverseerImpl implements AgentHooks {
             reportIssue("overseer.catalog-fallback", error, {
               handled: true,
               attributes: {
-                ...obsContext.get(), gadgetId: this.ctx.id.toString(), gatekeeperId,
+                ...obsContext.get(), gadgetId: this.ctx.id.name!, gatekeeperId,
               },
             });
             this.logger.warn("failed to load agent catalog", {
@@ -8545,9 +8543,9 @@ class OverseerImpl implements AgentHooks {
     }
 
     // Propagate to User DO.
-    let owner = this.users.get(this.users.idFromString(this.ownerId));
+    let owner = this.users.getByName(this.ownerId);
     let isFeatured = await owner.updateBlueprint(
-      record.id, record.metadata, this.ctx.id.toString()
+      record.id, record.metadata, this.ctx.id.name!
     );
 
     if (isFeatured) {
@@ -8561,7 +8559,7 @@ class OverseerImpl implements AgentHooks {
     let kvRecord: BlueprintKvRecord = {
       metadata: record.metadata,
       ownerId: this.ownerId,
-      gadgetId: this.ctx.id.toString(),
+      gadgetId: this.ctx.id.name!,
     };
     await this.env.BLUEPRINTS.put(record.id, JSON.stringify(kvRecord));
 
@@ -8582,7 +8580,7 @@ class OverseerImpl implements AgentHooks {
     await this.env.BLUEPRINT_CONTENT.delete(`${BLUEPRINT_SCREENSHOT_R2_PREFIX}${record.id}`);
 
     // Delete from User DO.
-    let owner = this.users.get(this.users.idFromString(this.ownerId));
+    let owner = this.users.getByName(this.ownerId);
     await this.ctx.exports.AdminSettings.getByName("").deleteFeaturedBlueprint(record.id);
     await owner.deleteBlueprint(record.id);
 
@@ -8637,7 +8635,7 @@ class OverseerImpl implements AgentHooks {
                             initiator: AiChatAuthorInfo): Promise<void> {
     try {
       let model = getModel(this.env, modelConfig, initiator, {
-        metadata: { source: "thread-title", gadgetId: this.ctx.id.toString(), chatId },
+        metadata: { source: "thread-title", gadgetId: this.ctx.id.name!, chatId },
       });
 
       let result = await completeText(model, {
@@ -8668,8 +8666,8 @@ class OverseerImpl implements AgentHooks {
       // apply the same title as the chat itself.
       if (chatId === 0 && ["Untitled Gadget", "Untitled Workspace"].includes(this.storage.title.get()) && this.ownerId) {
         this.storage.title.put(result);
-        let owner = this.users.get(this.users.idFromString(this.ownerId));
-        await owner.updateTitle(this.ctx.id.toString(), result);
+        let owner = this.users.getByName(this.ownerId);
+        await owner.updateTitle(this.ctx.id.name!, result);
       }
 
       // TODO: Should we track costs for title generation? It's pretty negligible.
@@ -8694,7 +8692,7 @@ class OverseerImpl implements AgentHooks {
       }
 
       let model = getModel(this.env, modelConfig, initiator, {
-        metadata: { source: "gadget-title", gadgetId: this.ctx.id.toString(), chatId },
+        metadata: { source: "gadget-title", gadgetId: this.ctx.id.name!, chatId },
       });
 
       let gadgetTitle = await completeText(model, {
@@ -8710,8 +8708,8 @@ class OverseerImpl implements AgentHooks {
       let title = gadgetTitle.trim();
       if (title && this.ownerId) {
         this.storage.title.put(title);
-        let owner = this.users.get(this.users.idFromString(this.ownerId));
-        await owner.updateTitle(this.ctx.id.toString(), title);
+        let owner = this.users.getByName(this.ownerId);
+        await owner.updateTitle(this.ctx.id.name!, title);
       }
     } catch (err) {
       // Oh well, just leave the title as-is.
@@ -8925,7 +8923,7 @@ class OverseerImpl implements AgentHooks {
     try {
       let tailProps = {
         executionId,
-        overseerId: this.ctx.id.toString(),
+        overseerId: this.ctx.id.name!,
       };
 
       let workerDef: WorkerLoaderWorkerCode = {
@@ -8957,9 +8955,9 @@ class OverseerImpl implements AgentHooks {
       // Create the `self` magic object that allows executed code to call back into this
       // chat thread. Uses the initiator's user ID for model resolution on callbacks.
       let selfStub = this.ctx.exports.AgentSelfLoopback({props: {
-        overseerId: this.ctx.id.toString(),
+        overseerId: this.ctx.id.name!,
         chatId,
-        initiatorUserId: this.users.idFromName(initiator.id).toString(),
+        initiatorUserId: initiator.id,
         initiatorModelId,
       }});
 
@@ -9034,11 +9032,11 @@ class OverseerImpl implements AgentHooks {
     if (!meta) return;
     let awaitingDecision = this.#decisionWait(chatId)?.pending ?? false;
     if (!awaitingDecision && initiator.type !== "user") return;
-    this.ctx.waitUntil(this.users.get(this.users.idFromString(initiatorUserId))
+    this.ctx.waitUntil(this.users.getByName(initiatorUserId)
         .publishNotification({
           id: crypto.randomUUID(),
           kind: awaitingDecision ? "permissionRequested" : "taskCompleted",
-          workspaceId: this.ctx.id.toString(),
+          workspaceId: this.ctx.id.name!,
           chatId,
           chatTitle: meta.title,
         }).catch(error => {
@@ -9134,7 +9132,7 @@ class OverseerImpl implements AgentHooks {
 
   #ownerUserStub() {
     if (!this.ownerId) throw new Error("Workspace has been deleted.");
-    return this.wrapUserDo(this.users.get(this.users.idFromString(this.ownerId)));
+    return this.wrapUserDo(this.users.getByName(this.ownerId));
   }
 
   // Short-TTL cache for the gatekeeper vendor list. The list is derived from static
@@ -9711,7 +9709,7 @@ class OverseerImpl implements AgentHooks {
   // for those who lost access entirely, and refresh the presentation-only role for those who were
   // downgraded.
   async refreshAffectedCollaboratorListings(affected: AffectedCollaborator[]): Promise<void> {
-    let gadgetId = this.ctx.id.toString();
+    let gadgetId = this.ctx.id.name!;
 
     // Fanned out because these are independent DO round-trips: revoking a share link can affect
     // everyone who joined through it, and one await each would make revocation take as long as the
@@ -10031,7 +10029,7 @@ class OverseerImpl implements AgentHooks {
     }
 
     if (!this.ownerId) throw new Error("Workspace is not initialized.");
-    const ownerDo = this.users.get(this.users.idFromString(this.ownerId));
+    const ownerDo = this.users.getByName(this.ownerId);
     const ownerProfile = await ownerDo.whoami();
     this.ownerProfileId = ownerProfile.id;
     return ownerProfile.id;
@@ -10193,7 +10191,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     this.lifecycle = Lifecycle.install(this);
     // Native RPC bypasses the Lifecycle's automatic startup, and the impl reads the job queue as it
     // recovers, so start it here; the impl's own blockConcurrencyWhile runs after this one.
-    ctx.blockConcurrencyWhile(() => startLifecycle(ctx, this.lifecycle));
+    ctx.blockConcurrencyWhile(() => this.lifecycle.start());
     this.impl = new OverseerImpl(ctx, env, this.lifecycle.jobs);
   }
 
@@ -10250,8 +10248,8 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       await this.ctx.blockConcurrencyWhile(async () => {
         // Verify that the owner believes it exists. The owner account must be initialized with
         // any new gadgets first before the gadget is actually opened.
-        let owner = this.impl.users.get(this.impl.users.idFromString(userId));
-        let meta = await owner.getGadget(this.ctx.id.toString());
+        let owner = this.impl.users.getByName(userId);
+        let meta = await owner.getGadget(this.ctx.id.name!);
         if (!meta) {
           throw createOpenGadgetError(OPEN_GADGET_ERROR_CODES.workspaceNotFound);
         }
@@ -10293,10 +10291,10 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       await ensureCapsules;
     }
 
-    let owner = this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId!));
+    let owner = this.impl.users.getByName(this.impl.ownerId!);
     let clientUser = isOwner
         ? owner
-        : this.impl.users.get(this.impl.users.idFromString(userId));
+        : this.impl.users.getByName(userId);
 
     // Refresh the owner's outputs index. Pushes are best-effort, and workspaces predating the
     // index have never pushed at all, so re-syncing on open is what corrects both.
@@ -10343,7 +10341,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       // Fire-and-forget a call to the collaborator's user DO so the gadget appears on
       // (or is refreshed on) their home page.
       let title = this.impl.storage.title.get();
-      let gadgetId = this.impl.ctx.id.toString();
+      let gadgetId = this.impl.ctx.id.name!;
       void (async () => {
         try {
           const ownerProfile = await owner.whoami();
@@ -10473,8 +10471,8 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     // Complete pending registration in the owner's UserDO.
     if (this.impl.storage.ownerRegistrationPending.get()) {
-      let owner = this.impl.users.get(this.impl.users.idFromString(ownerId));
-      await owner.ensureGadgetRegistered(this.ctx.id.toString(), this.impl.storage.title.get());
+      let owner = this.impl.users.getByName(ownerId);
+      await owner.ensureGadgetRegistered(this.ctx.id.name!, this.impl.storage.title.get());
       this.impl.storage.ownerRegistrationPending.put(false);
     }
 
@@ -10536,7 +10534,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       );
     }
 
-    return { accepted: true, chatPath: `/workspace/${this.ctx.id.toString()}?chat=${chatId}` };
+    return { accepted: true, chatPath: `/workspace/${this.ctx.id.name!}?chat=${chatId}` };
   }
 
   /**
@@ -10570,7 +10568,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // Fresh stub per call, so the pure whoami() read below is safe to retry once across a
     // user-DO reset (see retryOnDoReset: a captured stub would be permanently broken).
     let owner = () => this.impl.wrapUserDo(
-        this.impl.users.get(this.impl.users.idFromString(ownerId)));
+        this.impl.users.getByName(ownerId));
     let ownerProfile = await retryOnDoReset(() => owner().whoami(), this.impl.logger);
 
     // The gadget's history starts at an empty root of its own, into which its head merges the
@@ -10617,7 +10615,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // Mark gadget as non-provisional (it has code, so it should appear in the gadget list).
     // (A write, so deliberately not retried -- a reset can't distinguish "never applied" from
     // "applied, response lost".)
-    await owner().setGadgetLastActive(this.ctx.id.toString(), new Date(), undefined);
+    await owner().setGadgetLastActive(this.ctx.id.name!, new Date(), undefined);
   }
 
   async startGatekeeperSession(
@@ -10727,7 +10725,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // is recorded by deliverAgentCallback(), which starts the agent when it is idle; with no
     // model configured, calls are still appended to the chat, for a human to pick up.
     return this.impl.ctx.exports.AgentSelfLoopback({props: {
-      overseerId: this.impl.ctx.id.toString(),
+      overseerId: this.impl.ctx.id.name!,
       chatId,
       initiatorUserId,
       initiatorModelId: config.modelId,
@@ -10745,8 +10743,8 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // Resolve the model from the creating user's account (falls back to owner for
     // bindings created before collaborator support).
     let resolveUserId = creatorUserId ?? this.impl.ownerId;
-    let initiatorUserId = this.impl.users.idFromString(resolveUserId).toString();
-    let user = this.impl.users.get(this.impl.users.idFromString(resolveUserId));
+    let initiatorUserId = resolveUserId;
+    let user = this.impl.users.getByName(resolveUserId);
     let userMeta = await user.getChatContext(config.modelId);
 
     let chatId = this.impl.nextChatId();
@@ -10829,7 +10827,7 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
 
     let ns = ctx.exports.OverseerDurableObject;
     let stub: DurableObjectStub<OverseerDurableObject> =
-        ns.get(ns.idFromString(ctx.props.overseerId));
+        ns.getByName(ctx.props.overseerId);
 
     // @ts-ignore: LSP-only RPC types bug, "type instantiation is excessively deep"
     let session = stub.startGatekeeperSession(
@@ -10872,7 +10870,7 @@ export class GatekeeperHookLoopback
       {callback: NativeRpcStub<RpcTarget>, approvalQueue: NativeRpcStub<ApprovalQueue>}> {
     let ns = this.ctx.exports.OverseerDurableObject;
     let overseer: DurableObjectStub<OverseerDurableObject> =
-        ns.get(ns.idFromString(this.ctx.props.overseerId));
+        ns.getByName(this.ctx.props.overseerId);
 
     // Get an ApprovalQueue for this hook invocation from the overseer.
     // @ts-ignore seems the RPC types aren't working here
@@ -10906,7 +10904,7 @@ export class AgentSelfLoopback
 
     let ns = ctx.exports.OverseerDurableObject;
     let stub: DurableObjectStub<OverseerDurableObject> =
-        ns.get(ns.idFromString(ctx.props.overseerId));
+        ns.getByName(ctx.props.overseerId);
     let { chatId, initiatorUserId, initiatorModelId } = ctx.props;
 
     return new Proxy<AgentSelfLoopback>(<any>this, {
@@ -10943,7 +10941,7 @@ export class GadgetTailLoopback extends WorkerEntrypoint<Cloudflare.Env, GadgetT
   async #deliver(logs: ConsoleLogEvent[]) {
     let ns = this.ctx.exports.OverseerDurableObject;
     let stub: DurableObjectStub<OverseerDurableObject> =
-        ns.get(ns.idFromString(this.ctx.props.overseerId));
+        ns.getByName(this.ctx.props.overseerId);
     await stub.deliverGadgetLogs(this.ctx.props.chatId ?? null, logs);
   }
 
@@ -11049,7 +11047,7 @@ export class CodeModeTailLoopback extends WorkerEntrypoint<Cloudflare.Env, CodeM
 
     let ns = this.ctx.exports.OverseerDurableObject;
     let stub: DurableObjectStub<OverseerDurableObject> =
-        ns.get(ns.idFromString(this.ctx.props.overseerId));
+        ns.getByName(this.ctx.props.overseerId);
     await stub.deliverCodeModeTrace(this.ctx.props.executionId, event);
   }
 }
@@ -11094,12 +11092,12 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   get #owner(): DurableObjectStub<UserDurableObject> {
     if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
     return this.impl.wrapUserDo(
-        this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId)));
+        this.impl.users.getByName(this.impl.ownerId));
   }
 
   get #clientUser(): DurableObjectStub<UserDurableObject> {
     return this.impl.wrapUserDo(
-        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)));
+        this.impl.users.getByName(this.clientUserId));
   }
 
   #leaveSession: () => void;
@@ -11164,7 +11162,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async getMetadata(): Promise<GadgetMetadata> {
     let result: GadgetMetadata = {
-      id: this.impl.ctx.id.toString(),
+      id: this.impl.ctx.id.name!,
       title: this.impl.storage.title.get(),
       totalCost: this.impl.storage.totalCost.get(),
       containsRestrictedData: this.impl.storage.containsRestrictedData.get(),
@@ -11189,7 +11187,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         ? undefined : await retryOnDoReset(() => this.#owner.whoami(), this.impl.logger);
 
     let metadata: GadgetMetadata = {
-      id: this.impl.ctx.id.toString(),
+      id: this.impl.ctx.id.name!,
       title: this.impl.storage.title.get(),
       totalCost: this.impl.storage.totalCost.get(),
       containsRestrictedData: this.impl.storage.containsRestrictedData.get(),
@@ -11254,7 +11252,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async setTitle(title: string): Promise<void> {
     this.impl.storage.title.put(title);
-    await this.#owner.updateTitle(this.impl.ctx.id.toString(), title);
+    await this.#owner.updateTitle(this.impl.ctx.id.name!, title);
   }
 
   async subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>): Promise<RpcStub<{}>> {
@@ -11367,7 +11365,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
 
     await this.impl.ctx.blockConcurrencyWhile(async () => {
-      await this.#owner.deleteGadget(this.impl.ctx.id.toString());
+      await this.#owner.deleteGadget(this.impl.ctx.id.name!);
       await this.impl.ctx.storage.deleteAll();
       this.impl.recordGadgetAnalytics({
         event_name: "gadget_deleted",
@@ -11474,7 +11472,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       displayName: chatMeta.aiModel!.profile.name,
       config: chatMeta.aiModel!.config,
       initiator: this.impl.gadgetAuthorFor(chatMeta.profile),
-      metadata: { source: "model-binding", gadgetId: this.impl.ctx.id.toString() },
+      metadata: { source: "model-binding", gadgetId: this.impl.ctx.id.name! },
     }
 
     let creationSpec: GatekeeperCreationSpec = {
@@ -11522,7 +11520,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
 
     let props: AgentSpawnerBindingProps = {
-      overseerId: this.impl.ctx.id.toString(),
+      overseerId: this.impl.ctx.id.name!,
       config,
       creatorUserId: this.#clientUser.id.toString(),
     };
@@ -11659,7 +11657,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     if (!record.enabled) {
       let props: GatekeeperHookLoopbackProps = {
-        overseerId: this.impl.ctx.id.toString(),
+        overseerId: this.impl.ctx.id.name!,
         hookId: id,
       }
 
@@ -11672,7 +11670,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
           this.impl.ctx.exports.GatekeeperHookLoopback({props}) as unknown as
               Fetcher<HookInitiator<RpcTarget>>,
           {
-            workspaceId: this.impl.ctx.id.toString(),
+            workspaceId: this.impl.ctx.id.name!,
             ...(record.gadgetId !== undefined ? {gadgetId: record.gadgetId} : {}),
           });
 
@@ -12617,12 +12615,12 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   get #owner(): DurableObjectStub<UserDurableObject> {
     if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
     return this.impl.wrapUserDo(
-        this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId)));
+        this.impl.users.getByName(this.impl.ownerId));
   }
 
   get #clientUser(): DurableObjectStub<UserDurableObject> {
     return this.impl.wrapUserDo(
-        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)));
+        this.impl.users.getByName(this.clientUserId));
   }
 
   #leaveSession: () => void;
@@ -12662,7 +12660,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 
   async getMetadata(): Promise<GadgetMetadata> {
     return {
-      id: this.impl.ctx.id.toString(),
+      id: this.impl.ctx.id.name!,
       title: this.impl.storage.title.get(),
       owner: await retryOnDoReset(() => this.#owner.whoami(), this.impl.logger),
       role: "use",
@@ -12679,7 +12677,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     let owner = await retryOnDoReset(() => this.#owner.whoami(), this.impl.logger);
 
     let metadata: GadgetMetadata = {
-      id: this.impl.ctx.id.toString(),
+      id: this.impl.ctx.id.name!,
       title: this.impl.storage.title.get(),
       owner,
       role: "use",
@@ -12896,7 +12894,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
   get #clientUser(): DurableObjectStub<UserDurableObject> {
     return this.impl.wrapUserDo(
-        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)));
+        this.impl.users.getByName(this.clientUserId));
   }
 
   async getId(): Promise<WorkpieceId> {
@@ -13080,7 +13078,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     let bindings = this.impl.collectBindingMetadata(this.id);
 
     // Get gadget owner's profile for the author field.
-    let owner = this.impl.users.get(this.impl.users.idFromString(this.impl.ownerId));
+    let owner = this.impl.users.getByName(this.impl.ownerId);
     let ownerProfile = await owner.whoami();
 
     // The blueprint exports the gadget's committed code, keyed by its head commit. (Re-read the
@@ -13173,7 +13171,7 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
   // Fresh stub per call; see OverseerClientInterface.#clientUser.
   get #clientUser(): DurableObjectStub<UserDurableObject> {
     return this.impl.wrapUserDo(
-        this.impl.users.get(this.impl.users.idFromString(this.clientUserId)));
+        this.impl.users.getByName(this.clientUserId));
   }
 
   #deny(): never {
@@ -13499,8 +13497,7 @@ class AgentSpawnerBindingImpl extends RpcTarget {
 
   #getOverseer() {
     let ns = this.ctx.exports.OverseerDurableObject;
-    let id = ns.idFromString(this.ctx.props.overseerId);
-    return ns.get(id);
+    return ns.getByName(this.ctx.props.overseerId);
   }
 
   async spawn(title: string, prompt: string): Promise<void> {

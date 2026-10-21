@@ -182,7 +182,7 @@ function startTurn(responses: (() => Response)[], {
     if (usageLimited) impl.env = { ...impl.env, ENABLE_CLOUDFLARE_LIMITS: "true" };
     impl.ownerId = OWNER_USER_ID;
     impl.users = {
-      idFromString: (id: string) => id,
+      idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
       get: (userId: string) => ({
         getChatContext: async () => ({ profile: OWNER, aiModel: { profile: MODEL, config } }),
         getCloudflareGatekeeperAccount: async () => null,
@@ -203,7 +203,7 @@ function startTurn(responses: (() => Response)[], {
     impl.startAgent(CHAT_ID, { profile: MODEL, config }, initiator, INITIATOR_USER_ID);
     await impl.waitForAllAgentsToComplete();
   });
-  let gadgetId = env.TEST_OVERSEER.idFromName(workspace).toString();
+  let gadgetId = workspace;
   return { workspace, gadgetId, session, notifications, ...provider };
 }
 
@@ -383,7 +383,7 @@ describe("agent tracing", () => {
 
   it("traces approval of actions an agent submits", async () => {
     let workspace = `agent-tracing-${crypto.randomUUID()}`;
-    let gadgetId = env.TEST_OVERSEER.idFromName(workspace).toString();
+    let gadgetId = workspace;
     let poke = { tag: "poke", label: "Pokes" };
     await inOverseer(workspace, async impl => {
       impl.storage.gatekeepers.put({

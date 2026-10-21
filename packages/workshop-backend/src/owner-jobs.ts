@@ -13,6 +13,7 @@ import type {
   StartJobInput,
   StartJobResult,
 } from "@gadgets/workshop-shared/owner-jobs";
+import { workspaceNameFor } from "./do-names";
 
 /** Prefix of every workspace, chat and message key a job uses: apart from any gateway source. */
 export const JOB_SOURCE = "owner";
@@ -51,9 +52,9 @@ export type JobAccount = {
   listOutputs(): Promise<ListOutputsResult>;
 };
 
-/** The workspace an app lives in, by Durable Object name. */
-export function jobWorkspaceName(app: string): string {
-  return `${JOB_SOURCE}:app:${app}`;
+/** The workspace an app lives in, by Durable Object name: the same app always finds the same one. */
+export function jobWorkspaceName(app: string): Promise<string> {
+  return workspaceNameFor(`${JOB_SOURCE}:app:${app}`);
 }
 
 /** Submits the brief into the app's workspace as the owner; `notify` hears when the turn ends. */
@@ -67,7 +68,7 @@ export async function startJob(
   if (!input.brief.trim()) return {accepted: false, message: "Please include a brief."};
   if (input.brief.length > MAX_BRIEF) return {accepted: false, message: "The brief is too long."};
 
-  let result = await overseer(jobWorkspaceName(input.app)).receiveExternalMessage({
+  let result = await overseer(await jobWorkspaceName(input.app)).receiveExternalMessage({
     callerEmail: email,
     externalChatKey: `${JOB_SOURCE}:${input.chatKey ?? `app:${input.app}`}`,
     idempotencyKey: `${JOB_SOURCE}:job:${input.jobId}`,

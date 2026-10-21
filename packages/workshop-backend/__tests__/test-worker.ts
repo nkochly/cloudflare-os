@@ -220,7 +220,7 @@ export class GatekeeperUserPickerTestHooks extends DurableObject<Cloudflare.Env>
   async redeem(
       viewerId: string, accountId: number, ticket: string,
   ): Promise<{ identity: string; displayName: string }[] | { error: string }> {
-    const selectorUserId = this.ctx.exports.UserDurableObject.idFromName(viewerId).toString();
+    const selectorUserId = viewerId;
     const exchange = this.ctx.exports.GatekeeperUserSelectionExchangeImpl({
       props: { selectorUserId, appAccountId: accountId },
     });

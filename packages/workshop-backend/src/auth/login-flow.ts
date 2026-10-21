@@ -233,7 +233,7 @@ export class LoginConnectCallbackImpl
       if (this.ctx.props.vendorId === CLOUDFLARE_VENDOR_ID) {
         const accountId = await userStub.linkConnectedAccountFromLogin(
             account, this.ctx.props.vendorId, expiresAt);
-        await pending.link(userStub.id.toString(), accountId);
+        await pending.link(email, accountId);
       }
       // Session tokens are "<doName>:<secret>"; PublicApi.authenticate() routes via idFromName of
       // the first part. The user DO is keyed by email, so the prefix must be the email.
@@ -257,8 +257,7 @@ export class LoginConnectCallbackImpl
   async #linked(): Promise<{ user: DurableObjectStub<UserDurableObject>; accountId: number } | null> {
     const link = await this.#pending().getLink();
     if (!link) return null;
-    const id = this.ctx.exports.UserDurableObject.idFromString(link.userId);
-    return { user: this.ctx.exports.UserDurableObject.get(id), accountId: link.accountId };
+    return { user: this.ctx.exports.UserDurableObject.getByName(link.userId), accountId: link.accountId };
   }
 
   async credentialsExpired(): Promise<void> {

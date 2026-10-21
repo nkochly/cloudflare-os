@@ -123,7 +123,7 @@ describe("device session callback", () => {
       request(new URLSearchParams(fields), { mode: "cors" }),
       request(new URLSearchParams(fields), { destination: "iframe" }),
       request(new URLSearchParams(fields), { origin: "https://other.test" }),
-      request(new URLSearchParams({ ...fields, userDoId: "bad" })),
+      request(new URLSearchParams({ ...fields, userDoId: "" })),
       request(new URLSearchParams({ userDoId, state })),
       request(new URLSearchParams({ ...fields, ticket: "bad" })),
       request(new URLSearchParams([

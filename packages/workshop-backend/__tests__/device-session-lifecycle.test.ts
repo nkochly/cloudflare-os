@@ -143,7 +143,7 @@ describe("device session lifecycle", () => {
     await user.authenticateFromCfAccess("access-user@example.com", true);
     const { key, publicKey } = await appKey();
     const start = await user.stageDeviceSessionHandoff(publicKey, state, "access.jwt.value");
-    expect(start.userDoId).toMatch(/^[0-9a-f]{64}$/);
+    expect(start.userDoId).toBe(`device-session-${counter}`);
     expect(start.ticket).toMatch(/^[0-9a-f]{64}$/);
 
     const staged = await runInDurableObject(user, (instance: UserDurableObject) => {

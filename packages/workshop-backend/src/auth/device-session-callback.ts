@@ -44,7 +44,7 @@ export async function deviceSessionCallback(
   const userDoId = userDoIds.length === 1 ? userDoIds[0] : null;
   const state = states.length === 1 ? states[0] : null;
   const ticket = tickets.length === 1 ? tickets[0] : null;
-  if (typeof userDoId !== "string" || !LOWER_HEX_64.test(userDoId) ||
+  if (typeof userDoId !== "string" || userDoId.length === 0 || userDoId.length > 320 ||
       typeof state !== "string" || !isDeviceHandoffState(state) ||
       typeof ticket !== "string" || !LOWER_HEX_64.test(ticket)) {
     return new Response("Invalid device session request.", { status: 400, headers });

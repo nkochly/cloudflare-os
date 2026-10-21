@@ -73,7 +73,7 @@ function rejectUserCalls(impl: any, error: unknown): string[] {
     listModels: reject("listModels"),
     getChatContext: reject("getChatContext"),
   };
-  impl.users = { idFromString: (id: string) => id, get: () => user };
+  impl.users = { idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); }, get: () => user };
   return calls;
 }
 
@@ -107,7 +107,7 @@ describe("restarting a workspace whose loop counter is exhausted", () => {
     // still written.
     expect(logged(errors, "workspace.loop.limit.restart")).toEqual([expect.objectContaining({
       component: "workshop.overseer",
-      gadgetId: impl.ctx.id.toString(),
+      gadgetId: impl.ctx.id.name!,
       error: expect.stringContaining(LOOP_LIMIT_MESSAGE),
     })]);
     expect(logged(warnings, "gadget.last.active.bump.failed")).toHaveLength(1);

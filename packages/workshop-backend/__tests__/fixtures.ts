@@ -96,9 +96,9 @@ export async function openFakeOverseer(
       // which these tests never pass.
       authorizeCollaborator: async () => role,
       getSharingManager: async () => ({}),
-      ctx: { id: { toString: () => "workspace-id" }, exports: opts.exports ?? {} },
+      ctx: { id: { name: "workspace-id", toString: () => "workspace-id" }, exports: opts.exports ?? {} },
       users: {
-        idFromString: (id: string) => id,
+        idFromString: (id: string) => id, getByName(id: string) { return (this as any).get(id); },
         get: () => ({
           whoami: async () => ({ id: "profile-id", name: "Test User" }),
           recordSharedGadgetOpen: async () => {},

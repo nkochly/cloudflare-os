@@ -36,6 +36,7 @@ import { createWorkshopLogger } from "./observability";
 import { deployServiceInstall, routerVersionTag } from "./deployment-updates.js";
 import { retryOnDoReset, wrapDoStubForTelemetry } from "./do-retry";
 import { deviceSessionCallback } from "./auth/device-session-callback.js";
+import { newWorkspaceName, WORKSPACE_NAME } from "./do-names.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -340,15 +341,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   async #openGadgetInternal(id: string, shareKey?: string,
                             configureObservers?: RpcStub<ObserverConfigCallback>)
       : Promise<NativeRpcStub<Overseer>> {
-    let userId = this.#userId.toString();
+    let userId = this.#userId.name!;
     let profileId = this.#userId.name!;
-    let overseerId;
-    try {
-      overseerId = this.overseers.idFromString(id);
-    } catch {
-      throw createOpenGadgetError(OPEN_GADGET_ERROR_CODES.workspaceNotFound);
-    }
-    let overseer = this.overseers.get(overseerId);
+    if (!WORKSPACE_NAME.test(id)) throw createOpenGadgetError(OPEN_GADGET_ERROR_CODES.workspaceNotFound);
+    let overseer = this.overseers.getByName(id);
 
     // HACK: Detect loss of the connection to the DO by:
     // - Pass a callback to overseer.open() which it should call when the session is disposed.
@@ -399,7 +395,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async newGadget(): Promise<RpcStub<Overseer>> {
-    let id = this.overseers.newUniqueId().toString();
+    let id = newWorkspaceName();
     await this.#user.newGadget(id, "Untitled Workspace");
     recordAnalytics(this.ctx, this.env, {
       event_name: "gadget_created",
@@ -538,7 +534,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
       let kvRecord: BlueprintKvRecord = {
         metadata,
-        ownerId: this.#userId.toString(),
+        ownerId: this.#userId.name!,
       };
 
       await this.env.BLUEPRINTS.put(blueprintId, JSON.stringify(kvRecord));
@@ -570,13 +566,13 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     if (!kvRecord) throw new Error("Blueprint not found.");
 
     // 2. Create new Overseer DO (same as newGadget()).
-    let id = this.overseers.newUniqueId().toString();
+    let id = newWorkspaceName();
     await this.#user.newGadget(id, kvRecord.metadata.title);
     let overseerResult = await this.#openGadgetInternal(id);
 
     // 3. Initialize from the blueprint's code. The Overseer reads it for itself, as the version
     //    this metadata describes, so that it is the code the bindings assigned below belong to.
-    let overseerDo = this.overseers.get(this.overseers.idFromString(id));
+    let overseerDo = this.overseers.getByName(id);
     await overseerDo.initializeFromBlueprint(blueprintId, kvRecord.metadata,
         deploymentOutputForBlueprint(await readAdminConfig(this.env), blueprintId,
             sanitizeBlueprintOutput(kvRecord.metadata.output)));
@@ -1006,16 +1002,10 @@ export default {
             headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
           });
         }
-        expectedUserDoId = ctx.exports.UserDurableObject.idFromName(payload.email).toString();
+        expectedUserDoId = payload.email;
       }
       return deviceSessionCallback(req, async (userDoId, state, ticket) => {
-        let id: DurableObjectId;
-        try {
-          id = ctx.exports.UserDurableObject.idFromString(userDoId);
-        } catch {
-          return null;
-        }
-        return await ctx.exports.UserDurableObject.get(id).consumeDeviceSessionHandoff(state, ticket);
+        return await ctx.exports.UserDurableObject.getByName(userDoId).consumeDeviceSessionHandoff(state, ticket);
       }, expectedUserDoId);
     }
 

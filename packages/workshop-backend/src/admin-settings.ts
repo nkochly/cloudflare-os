@@ -240,7 +240,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
     return {
       owner: kvRecord.ownerId
-          ? this.users.get(this.users.idFromString(kvRecord.ownerId))
+          ? this.users.getByName(kvRecord.ownerId)
           : undefined,
       publicInfo: {
         id: blueprintId,
