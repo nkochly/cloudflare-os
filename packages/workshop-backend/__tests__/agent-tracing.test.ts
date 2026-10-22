@@ -361,9 +361,12 @@ describe("agent tracing", () => {
     await inOverseer(turn.workspace, impl =>
         impl.deliverAgentCallback(CHAT_ID, "ping", [], OWNER_USER_ID, MODEL.id));
     turn.release();
+    await turn.session;
 
-    let [first, second] = (await turnSpans(turn, 2))
-        .filter(span => span.name.startsWith("invoke_agent"));
+    // The second turn's span is checked open: it is the run's, not the first turn's teardown's.
+    let turns = (await env.SPAN_RECORDER.spans()).filter(span => span.name.startsWith("invoke_agent"));
+    let at = turns.findIndex(span => span.attributes["gen_ai.agent.id"] === turn.gadgetId);
+    let [first, second] = turns.slice(at, at + 2);
     expect(second.parentSpanId).toBe(first.parentSpanId);
   });
 
@@ -458,7 +461,7 @@ describe("turn notifications", () => {
         impl.deliverAgentCallback(CHAT_ID, "ping", [], OWNER_USER_ID, MODEL.id));
     turn.release();
 
-    await turnSpans(turn, 2);
+    await turn.session;
     expect(turn.notifications).toEqual([notification(turn, "taskCompleted")]);
   });
 

@@ -163,28 +163,4 @@ describe("describeBinding", () => {
 
     expect(toolResultTexts(replayed[0])).toEqual(toolResultTexts(live));
   }));
-
-  it("elides descriptions from logs that predate recording them", () => withImpl(async impl => {
-    seedWorkspace(impl);
-    await runDescribeTurn(impl);
-
-    // Strip the recorded descriptions, as in a log persisted before they were recorded.
-    for (let msg of [...impl.storage.chats.list()] as AiChatMessage[]) {
-      if (msg.type !== "message" || !msg.toolCalls) continue;
-      for (let call of msg.toolCalls) {
-        if (call.toolName === "describeBinding") delete call.output;
-      }
-      impl.storage.chats.put(msg);
-    }
-    addUserMessage(impl, "Again");
-
-    let replayed = await runScriptedTurn(impl, [fauxAssistantMessage(fauxText("Done."))]);
-
-    let texts = toolResultTexts(replayed[0]);
-    for (let text of texts.slice(0, 4)) {
-      expect(text).toMatch(/no longer available\. Call describeBinding again/);
-    }
-    // Failed calls replay their recorded errors as before.
-    expect(texts[4]).toMatch(/Gadget OTHER has no binding named "MISSING"/);
-  }));
 });

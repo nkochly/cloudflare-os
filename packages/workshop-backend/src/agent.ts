@@ -15,7 +15,7 @@ import type {
   ToolResultMessage, Usage,
 } from "@earendil-works/pi-ai";
 import {
-  runAgentLoopContinue, type AgentContext, type AgentEvent, type AgentTool,
+  type AgentEvent, type AgentTool,
 } from "@earendil-works/pi-agent-core";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
@@ -28,6 +28,7 @@ import { formatInstanceInstructions } from "./admin-config";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
+import type { PiChats } from "./pi-chat";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
 import type { ModelHandle } from "./ai-models";
 import { blobOid } from "./git-store";
@@ -36,14 +37,9 @@ import type {
   StoredChatMessage, StoredToolCall,
 } from "./storage-schema/overseer-storage";
 import {
-  buildCompactionState, buildSummaryPrompt, chatChangeStatuses, COMPACTION_SYSTEM_PROMPT,
-  estimateProjectionTokens, findCompactionBoundary, findProtectedFromSequence,
-  foldProposedChanges, getModelTokenLimits, isCompactionTurn, shouldCompactChat,
+  chatChangeStatuses, foldProposedChanges, getModelTokenLimits, isCompactionTurn,
   type CompactionProjectionMessage,
 } from "./agent-compaction";
-import {
-  requestAnthropicCompaction, supportsAnthropicCompaction, withAnthropicCompactionBlock,
-} from "./anthropic-compaction";
 import { formatGrep, type GrepScan } from "./grep";
 
 const logger = createWorkshopLogger("workshop.agent");
@@ -309,6 +305,8 @@ export function makeStoredAssistantMessage(message: AssistantMessage): StoredAss
  *   overseer.ts?
  */
 export interface AgentHooks {
+  /** The Pi engine every turn runs on. */
+  readonly piChats: PiChats;
   getChatAgentContext(chatId: number): AiChatAgentContext;
 
   /** Records the chat's AiChatAgentContext.workspacePrompt. */
@@ -369,9 +367,6 @@ export interface AgentHooks {
    * pass can compact or persist steps.
    */
   loadChatHistory(chatId: number): ChatHistory;
-
-  /** Publish a compaction checkpoint: later history loads start from it. */
-  commitChatCompaction(chatId: number, checkpoint: CompactionCheckpoint): void;
 
   /**
    * The gadget's current head commit (WorkpieceSummary.commitId), or undefined if it has none:
@@ -1455,10 +1450,16 @@ function makeReplayAssistantMessage(
 // outside its own tool calls (the user's edits, a revert, a catalog change), keyed by the chat
 // message that records it. The result is plain text, not JSON: a JSON-escaped diff full of quotes
 // and braces would be needlessly hard to read, and the result is only ever fed to the model.
+/** The call id prefix of the observeUserChanges results replay makes from the chat log. */
+const OBSERVATION_CALL_PREFIX = "synthetic_";
+/** How a replayed observation is framed when it reaches Pi with the user's input. */
+export const USER_CHANGES_OPEN = "<user_changes>";
+export const USER_CHANGES_CLOSE = "</user_changes>";
+
 function makeReplayObservation(
     sequence: number, text: string, model: ModelHandle["model"], timestamp: number)
     : [AssistantMessage, ToolResultMessage] {
-  let toolCallId = `synthetic_${sequence}`;
+  let toolCallId = `${OBSERVATION_CALL_PREFIX}${sequence}`;
   return [
     makeReplayAssistantMessage(
         [{type: "toolCall", id: toolCallId, name: "observeUserChanges", arguments: {}}],
@@ -1474,6 +1475,244 @@ function makeReplayObservation(
   ];
 }
 
+// Schema fragment for the file tools' workpiece reference. Note that although historical logs
+// allow these tool calls to omit this param, is is required in all new tool calls, hence we do
+// not describe it as optional here.
+const workpieceParam = Type.String({
+  description:
+      "Env binding name of the workpiece (gadget or worktree) that owns the file, as listed " +
+      "in the system prompt or chosen when creating it.",
+});
+
+/**
+ * The agent's tools as the model sees them: name, description and parameters. Static, so Pi's
+ * registry can declare them before any turn builds their implementations.
+ */
+export const AGENT_TOOL_DECLARATIONS = {
+  readFile: {
+    name: "readFile",
+    description: READ_FILE_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      workpiece: workpieceParam,
+      filename: Type.String({description: "Name of the file to read."}),
+      startLine: Type.Optional(Type.Integer({
+        minimum: 1,
+        description: "First line to return, 1-based. Omit to start at the top.",
+      })),
+      lineCount: Type.Optional(Type.Integer({
+        minimum: 1,
+        description: "Number of lines to return from startLine. Omit for all remaining lines.",
+      })),
+    }),
+  },
+  grep: {
+    name: "grep",
+    description: GREP_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      workpiece: workpieceParam,
+      pattern: Type.String({description: "Regular expression matched against each line."}),
+      path: Type.Optional(Type.String({
+        description: "File or directory to search, relative to the workpiece root. Omit to " +
+            "search every file.",
+      })),
+    }),
+  },
+  writeFile: {
+    name: "writeFile",
+    description: WRITE_FILE_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      workpiece: workpieceParam,
+      filename: Type.String({description: "Name of the file to write."}),
+      content: Type.String({description: "The entire content of the file to write."}),
+    }),
+  },
+  editFile: {
+    name: "editFile",
+    description: EDIT_FILE_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      workpiece: workpieceParam,
+      filename: Type.String({description: "Name of the file to edit."}),
+      textToReplace: Type.String({
+        description: "Exact existing text which is to be replaced. This string must match " +
+            "exactly one location in the file, or the edit will fail.",
+      }),
+      replacement: Type.String({
+        description: "Text which should be inserted, replacing the matched text.",
+      }),
+      // TODO: Line number hint, to disambiguate multiple matches?
+    }),
+  },
+  webFetch: {
+    name: "webFetch",
+    description: WEBFETCH_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      url: Type.String({description: "The HTTPS URL to fetch."}),
+      raw: Type.Optional(Type.Boolean({
+        description:
+            "If true, return the exact content the server sent (HTML, JSON, etc.) " +
+            "without any conversion. Default: false, which converts supported document " +
+            "formats (HTML, PDF, DOCX, ...) to Markdown.",
+      })),
+    }),
+  },
+  observeUserChanges: {
+    name: "observeUserChanges",
+    description: OBSERVE_USER_CHANGES_TOOL_DESCRIPTION,
+    parameters: Type.Object({}),
+  },
+  describeBinding: {
+    name: "describeBinding",
+    description: DESCRIBE_BINDING_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      name: Type.String({description: "Name of the binding (a property of `env`)."}),
+      gadget: Type.Optional(Type.String({
+        description:
+            "Env binding name of a gadget. When given, `name` is a binding in that gadget's " +
+            "own env (as its code sees it) rather than in yours.",
+      })),
+    }),
+  },
+  setGadgetBinding: {
+    name: "setGadgetBinding",
+    description: SET_GADGET_BINDING_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      gadget: Type.String({
+        description: "Env binding name of the gadget whose bindings to modify.",
+      }),
+      source: Type.String({
+        description: "Env binding name of the resource to wire into the gadget.",
+      }),
+      name: Type.Optional(Type.String({
+        description:
+            "Name to bind the resource under within the gadget (`env.<name>` in the gadget's " +
+            "own code). Defaults to the same name as `source`. Style: ALL_CAPS_WITH_UNDERSCORES.",
+      })),
+    }),
+  },
+  createGadget: {
+    name: "createGadget",
+    description: CREATE_GADGET_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      title: Type.String({
+        description:
+            "Short, descriptive, human-readable title for the new gadget. Shown to the user.",
+      }),
+      bindingName: Type.String({
+        description:
+            "Name under which the new gadget appears in your env, and how other tools refer " +
+            "to it (e.g. the file tools' `workpiece` parameter). Must be a JavaScript " +
+            "identifier not already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
+      }),
+      blueprintId: Type.Optional(Type.String({
+        description:
+            "If given, initialize the new gadget from this blueprint's code instead of empty. " +
+            "Use the listBlueprints tool to discover available blueprint IDs.",
+      })),
+    }),
+  },
+  createWorktree: {
+    name: "createWorktree",
+    description: CREATE_WORKTREE_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      title: Type.String({
+        description:
+            "Short, descriptive, human-readable title for the new worktree. Shown to the user.",
+      }),
+      bindingName: Type.String({
+        description:
+            "Name under which the new worktree appears in your env, and how the file tools " +
+            "refer to it (their `workpiece` parameter). Must be a JavaScript identifier not " +
+            "already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
+      }),
+      commitId: Type.String({
+        description:
+            "The git commit to root the worktree at: its full 40-hex SHA-1, exactly as " +
+            "returned by the API that provided it. Abbreviated ids are not accepted.",
+      }),
+    }),
+  },
+  listBlueprints: {
+    name: "listBlueprints",
+    description: LIST_BLUEPRINTS_TOOL_DESCRIPTION,
+    parameters: Type.Object({}),
+  },
+  executeCode: {
+    name: "executeCode",
+    description: EXECUTE_CODE_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      code: Type.String({
+        description:
+            "Code to execute. This must be a complete self-contained JavaScript module " +
+            "which exports a single async function, like so:\n" +
+            "\n" +
+            "```\n" +
+            "export default async function(self, env, ctx) {\n" +
+            "  // ... code to execute ...\n" +
+            "}\n" +
+            "```\n" +
+            "\n" +
+            "`env` and `ctx` are the usual objects passed to Cloudflare Workers event " +
+            "handlers. `env` contains the bindings, and `ctx` contains various functions " +
+            "and information related to the execution context. `self` is a magic object " +
+            "that points back to this chat thread.",
+      }),
+    }),
+  },
+  listConnectableResources: {
+    name: "listConnectableResources",
+    description: LIST_CONNECTABLE_RESOURCES_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      vendorId: Type.String({
+        description: "Vendor id, as listed in the system prompt (e.g. 'github').",
+      }),
+    }),
+  },
+  requestConnection: {
+    name: "requestConnection",
+    description: REQUEST_CONNECTION_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      vendorId: Type.String({
+        description: "Vendor id, as listed in the system prompt (e.g. 'github').",
+      }),
+      resourceUrl: Type.Optional(Type.String({
+        description:
+            "The specific resource URL, if known (matching a pattern from " +
+            "listConnectableResources). Omit if you don't know the exact resource; the user " +
+            "will pick it.",
+      })),
+      reason: Type.String({
+        description: "A short explanation of why you need this connection, shown to the user.",
+      }),
+      bindingName: Type.String({
+        description:
+            "Name under which the resource will appear in your env once the user accepts. " +
+            "Must be a JavaScript identifier not already in use; pick a name reflecting why " +
+            "you want the resource. Style: ALL_CAPS_WITH_UNDERSCORES.",
+      }),
+    }),
+  },
+  createExternalResource: {
+    name: "createExternalResource",
+    description: CREATE_EXTERNAL_RESOURCE_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      vendorId: Type.String({
+        description: "Vendor id, as listed in the system prompt (e.g. 'google').",
+      }),
+      resourceUrlPattern: Type.String({
+        description: "urlPattern of a creatable resource type, from listConnectableResources.",
+      }),
+      title: Type.String({
+        description: "Title of the new resource, e.g. the document's title.",
+      }),
+      bindingName: Type.String({
+        description:
+            "Name under which the new resource appears in your env. Must be a JavaScript " +
+            "identifier not already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
+      }),
+    }),
+  },
+} satisfies Record<string, {name: string; description: string; parameters: TSchema}>;
+
 // Builds an AgentTool while keeping `execute`'s params typed by its TypeBox schema; the cast to
 // the untyped AgentTool erases the parameter type (pi validates tool-call arguments against the
 // schema before calling execute, so the runtime types are guaranteed).
@@ -1481,17 +1720,11 @@ function defineTool<TParameters extends TSchema>(def: AgentTool<TParameters>): A
   return def as unknown as AgentTool;
 }
 
-/** How many times one agent turn retries a model request that failed transiently. */
-const TRANSIENT_FAILURE_RETRIES = 2;
-
 /**
- * Runs one agent turn against the chat's history, compacting as needed. A pass over the history
- * may compact instead of prompting the model, or end after a persisted tool step because the next
- * request would cross the compaction trigger; either way the loop reloads the durable history,
- * which the next pass compacts first, and goes again. Each compaction moves the boundary strictly
- * forward and can never pass the newest turn start, so the loop is bounded. `/compact` is done once
- * it has compacted; the model is never prompted. A pass whose model request failed transiently is
- * also run again, a bounded number of times.
+ * Runs one agent turn on the chat's Pi session (see pi-chat.ts). Pi runs the model requests and
+ * the tool calls, retries failed requests, and compacts its transcript; this pass supplies the
+ * tools, streams to clients, and writes each completed round to the chat log. `/compact` asks
+ * Pi to compact now; the model is never prompted.
  */
 export async function runAgent(
     hooks: AgentHooks,
@@ -1501,27 +1734,12 @@ export async function runAgent(
     abortSignal: AbortSignal,
     initiator: AiChatAuthorInfo,
     modelConfig: AiModelConfig): Promise<void> {
-  // Provider retries and compaction reloads are passes of this execution, not new executions.
   const progress: AgentProgress = {
     executionId: crypto.randomUUID(),
     barrierSequence: 0,
   };
-  let retries = 0;
-  while (true) {
-    let history = hooks.loadChatHistory(chatId);
-    let outcome = await runAgentPass(
-        hooks, handle, chatId, author, history, abortSignal, initiator, modelConfig, progress);
-    if (outcome.type === "transientFailure") {
-      if (++retries > TRANSIENT_FAILURE_RETRIES) throw outcome.error;
-      // The failed request persisted nothing, so the retry starts from the last saved step. What
-      // it streamed was only provisional; clients drop it so the retry doesn't append to it.
-      hooks.emitChatStreamEvent(chatId, {type: "streamReset"});
-      await scheduler.wait(1000 * retries);
-    }
-    if (outcome.type === "compacted") hooks.commitChatCompaction(chatId, outcome.checkpoint);
-    if (outcome.type === "finished" || isCompactionTurn(history.chatMessages)) return;
-    abortSignal.throwIfAborted();
-  }
+  await runAgentPass(hooks, handle, chatId, author, hooks.loadChatHistory(chatId), abortSignal,
+      initiator, modelConfig, progress);
 }
 
 async function runAgentPass(
@@ -3181,23 +3399,8 @@ async function runAgentPass(
 
   // Some models charge their response to the same window as the prompt, so the reservation is both
   // withheld from the prompt's budget and sent as the response cap -- the two can't disagree.
-  let {inputBudget, maxOutputTokens} = getModelTokenLimits(modelConfig);
+  let {maxOutputTokens} = getModelTokenLimits(modelConfig);
 
-  let projection: CompactionProjectionMessage[] = modelMessages.map((message, index) => ({
-    message, ...modelMessageSources[index],
-  }));
-  let lastMeasuredSequence = chatMessages.findLast(message =>
-    message.type === "message" && message.author.type === "agent")?.sequence;
-  // `measuredTokens` covers the prompt and response of the last model step, so estimate only what
-  // was added after it. A tool result carries the call's sequence but wasn't in that usage.
-  // (The system prompt is not part of the projection, so the pure estimate adds it separately.)
-  let contextTokens = measuredTokens > 0 && lastMeasuredSequence !== undefined
-    ? measuredTokens + estimateProjectionTokens(
-        projection.filter(({message, sequence}) => sequence !== undefined &&
-          (sequence > lastMeasuredSequence ||
-           (sequence === lastMeasuredSequence && message.role === "toolResult"))))
-    : estimateProjectionTokens(projection) +
-        Math.ceil(getSystemMessageText(systemMessage).length / 4);
 
   // Wraps a plain-text tool result (the exact text the model sees) with optional recorded notes
   // (see AiToolCall: observedCodeVersion, recorded output) riding along as pi `details` for the
@@ -3208,32 +3411,13 @@ async function runAgentPass(
     details: notes,
   });
 
-  // Schema fragment for the file tools' workpiece reference. Note that although historical logs
-  // allow these tool calls to omit this param, is is required in all new tool calls, hence we do
-  // not describe it as optional here.
-  let workpieceParam = Type.String({
-    description:
-        "Env binding name of the workpiece (gadget or worktree) that owns the file, as listed " +
-        "in the system prompt or chosen when creating it.",
-  });
 
   let tools: Record<string, AgentTool> = {
     readFile: defineTool({
       name: "readFile",
       label: "Read file",
       description: READ_FILE_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        workpiece: workpieceParam,
-        filename: Type.String({description: "Name of the file to read."}),
-        startLine: Type.Optional(Type.Integer({
-          minimum: 1,
-          description: "First line to return, 1-based. Omit to start at the top.",
-        })),
-        lineCount: Type.Optional(Type.Integer({
-          minimum: 1,
-          description: "Number of lines to return from startLine. Omit for all remaining lines.",
-        })),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.readFile.parameters,
       execute: async (toolCallId, {workpiece, filename, startLine, lineCount}) => {
         try {
           let resolved =
@@ -3260,14 +3444,7 @@ async function runAgentPass(
       name: "grep",
       label: "Search files",
       description: GREP_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        workpiece: workpieceParam,
-        pattern: Type.String({description: "Regular expression matched against each line."}),
-        path: Type.Optional(Type.String({
-          description: "File or directory to search, relative to the workpiece root. Omit to " +
-              "search every file.",
-        })),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.grep.parameters,
       execute: async (toolCallId, {workpiece, pattern, path}) => {
         try {
           let {workpieceId} =
@@ -3295,11 +3472,7 @@ async function runAgentPass(
       name: "writeFile",
       label: "Write file",
       description: WRITE_FILE_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        workpiece: workpieceParam,
-        filename: Type.String({description: "Name of the file to write."}),
-        content: Type.String({description: "The entire content of the file to write."}),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.writeFile.parameters,
       execute: async (toolCallId, {workpiece, filename, content: newContent}) => {
         try {
           let resolved =
@@ -3359,18 +3532,7 @@ async function runAgentPass(
       name: "editFile",
       label: "Edit file",
       description: EDIT_FILE_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        workpiece: workpieceParam,
-        filename: Type.String({description: "Name of the file to edit."}),
-        textToReplace: Type.String({
-          description: "Exact existing text which is to be replaced. This string must match " +
-              "exactly one location in the file, or the edit will fail.",
-        }),
-        replacement: Type.String({
-          description: "Text which should be inserted, replacing the matched text.",
-        }),
-        // TODO: Line number hint, to disambiguate multiple matches?
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.editFile.parameters,
       execute: async (toolCallId, {workpiece, filename, textToReplace, replacement}) => {
         try {
           let resolved =
@@ -3456,15 +3618,7 @@ async function runAgentPass(
       name: "webFetch",
       label: "Fetch web page",
       description: WEBFETCH_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        url: Type.String({description: "The HTTPS URL to fetch."}),
-        raw: Type.Optional(Type.Boolean({
-          description:
-              "If true, return the exact content the server sent (HTML, JSON, etc.) " +
-              "without any conversion. Default: false, which converts supported document " +
-              "formats (HTML, PDF, DOCX, ...) to Markdown.",
-        })),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.webFetch.parameters,
       execute: async (toolCallId, {url, raw}) => {
         try {
           let result = await webFetchImpl(hooks.getWebFetchEnv(), {url, raw});
@@ -3511,7 +3665,7 @@ async function runAgentPass(
       name: "observeUserChanges",
       label: "Observe user changes",
       description: OBSERVE_USER_CHANGES_TOOL_DESCRIPTION,
-      parameters: Type.Object({}),
+      parameters: AGENT_TOOL_DECLARATIONS.observeUserChanges.parameters,
       execute: async () => {
         // The agent shouldn't be calling this explicitly.
         return toolResult(OBSERVE_USER_CHANGES_NOOP_RESULT);
@@ -3522,14 +3676,7 @@ async function runAgentPass(
       name: "describeBinding",
       label: "Describe binding",
       description: DESCRIBE_BINDING_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        name: Type.String({description: "Name of the binding (a property of `env`)."}),
-        gadget: Type.Optional(Type.String({
-          description:
-              "Env binding name of a gadget. When given, `name` is a binding in that gadget's " +
-              "own env (as its code sees it) rather than in yours.",
-        })),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.describeBinding.parameters,
       execute: async (toolCallId, input) => {
         try {
           // Deliberately not bounded to MAX_TOOL_RESULT_CHARS: the agent can't write code
@@ -3550,19 +3697,7 @@ async function runAgentPass(
       name: "setGadgetBinding",
       label: "Bind resource to gadget",
       description: SET_GADGET_BINDING_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        gadget: Type.String({
-          description: "Env binding name of the gadget whose bindings to modify.",
-        }),
-        source: Type.String({
-          description: "Env binding name of the resource to wire into the gadget.",
-        }),
-        name: Type.Optional(Type.String({
-          description:
-              "Name to bind the resource under within the gadget (`env.<name>` in the gadget's " +
-              "own code). Defaults to the same name as `source`. Style: ALL_CAPS_WITH_UNDERSCORES.",
-        })),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.setGadgetBinding.parameters,
       execute: async (toolCallId, {gadget, source, name}) => {
         try {
           let gadgetEntry = chatBindings.get(gadget);
@@ -3612,23 +3747,7 @@ async function runAgentPass(
       name: "createGadget",
       label: "Create gadget",
       description: CREATE_GADGET_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        title: Type.String({
-          description:
-              "Short, descriptive, human-readable title for the new gadget. Shown to the user.",
-        }),
-        bindingName: Type.String({
-          description:
-              "Name under which the new gadget appears in your env, and how other tools refer " +
-              "to it (e.g. the file tools' `workpiece` parameter). Must be a JavaScript " +
-              "identifier not already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
-        }),
-        blueprintId: Type.Optional(Type.String({
-          description:
-              "If given, initialize the new gadget from this blueprint's code instead of empty. " +
-              "Use the listBlueprints tool to discover available blueprint IDs.",
-        })),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.createGadget.parameters,
       execute: async (toolCallId, {title, bindingName, blueprintId}) => {
         try {
           validateBindingName(bindingName);
@@ -3714,23 +3833,7 @@ async function runAgentPass(
       name: "createWorktree",
       label: "Create worktree",
       description: CREATE_WORKTREE_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        title: Type.String({
-          description:
-              "Short, descriptive, human-readable title for the new worktree. Shown to the user.",
-        }),
-        bindingName: Type.String({
-          description:
-              "Name under which the new worktree appears in your env, and how the file tools " +
-              "refer to it (their `workpiece` parameter). Must be a JavaScript identifier not " +
-              "already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
-        }),
-        commitId: Type.String({
-          description:
-              "The git commit to root the worktree at: its full 40-hex SHA-1, exactly as " +
-              "returned by the API that provided it. Abbreviated ids are not accepted.",
-        }),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.createWorktree.parameters,
       execute: async (toolCallId, {title, bindingName, commitId}) => {
         try {
           validateBindingName(bindingName);
@@ -3770,7 +3873,7 @@ async function runAgentPass(
       name: "listBlueprints",
       label: "List blueprints",
       description: LIST_BLUEPRINTS_TOOL_DESCRIPTION,
-      parameters: Type.Object({}),
+      parameters: AGENT_TOOL_DECLARATIONS.listBlueprints.parameters,
       execute: async (toolCallId) => {
         try {
           let output = await hooks.listAvailableBlueprints(initiator);
@@ -3787,24 +3890,7 @@ async function runAgentPass(
       label: "Execute code",
       description: agentContext.spawnerConfig
           ? SPAWNED_EXECUTE_CODE_TOOL_DESCRIPTION : EXECUTE_CODE_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        code: Type.String({
-          description:
-              "Code to execute. This must be a complete self-contained JavaScript module " +
-              "which exports a single async function, like so:\n" +
-              "\n" +
-              "```\n" +
-              "export default async function(self, env, ctx) {\n" +
-              "  // ... code to execute ...\n" +
-              "}\n" +
-              "```\n" +
-              "\n" +
-              "`env` and `ctx` are the usual objects passed to Cloudflare Workers event " +
-              "handlers. `env` contains the bindings, and `ctx` contains various functions " +
-              "and information related to the execution context. `self` is a magic object " +
-              "that points back to this chat thread.",
-        }),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.executeCode.parameters,
       execute: async (toolCallId, {code}) => {
         try {
           // Step-transactionality guard: buffered edits are durable only at the step's
@@ -3840,11 +3926,7 @@ async function runAgentPass(
       name: "listConnectableResources",
       label: "List connectable resources",
       description: LIST_CONNECTABLE_RESOURCES_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        vendorId: Type.String({
-          description: "Vendor id, as listed in the system prompt (e.g. 'github').",
-        }),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.listConnectableResources.parameters,
       execute: async (toolCallId, {vendorId}) => {
         try {
           let output = await hooks.listConnectableResources(vendorId);
@@ -3860,26 +3942,7 @@ async function runAgentPass(
       name: "requestConnection",
       label: "Request connection",
       description: REQUEST_CONNECTION_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        vendorId: Type.String({
-          description: "Vendor id, as listed in the system prompt (e.g. 'github').",
-        }),
-        resourceUrl: Type.Optional(Type.String({
-          description:
-              "The specific resource URL, if known (matching a pattern from " +
-              "listConnectableResources). Omit if you don't know the exact resource; the user " +
-              "will pick it.",
-        })),
-        reason: Type.String({
-          description: "A short explanation of why you need this connection, shown to the user.",
-        }),
-        bindingName: Type.String({
-          description:
-              "Name under which the resource will appear in your env once the user accepts. " +
-              "Must be a JavaScript identifier not already in use; pick a name reflecting why " +
-              "you want the resource. Style: ALL_CAPS_WITH_UNDERSCORES.",
-        }),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.requestConnection.parameters,
       execute: async (toolCallId, input) => {
         try {
           // Validate the chosen name before creating anything. Like a server-side rejection,
@@ -3921,22 +3984,7 @@ async function runAgentPass(
       name: "createExternalResource",
       label: "Create external resource",
       description: CREATE_EXTERNAL_RESOURCE_TOOL_DESCRIPTION,
-      parameters: Type.Object({
-        vendorId: Type.String({
-          description: "Vendor id, as listed in the system prompt (e.g. 'google').",
-        }),
-        resourceUrlPattern: Type.String({
-          description: "urlPattern of a creatable resource type, from listConnectableResources.",
-        }),
-        title: Type.String({
-          description: "Title of the new resource, e.g. the document's title.",
-        }),
-        bindingName: Type.String({
-          description:
-              "Name under which the new resource appears in your env. Must be a JavaScript " +
-              "identifier not already in use; style: ALL_CAPS_WITH_UNDERSCORES.",
-        }),
-      }),
+      parameters: AGENT_TOOL_DECLARATIONS.createExternalResource.parameters,
       execute: async (toolCallId, input) => {
         try {
           validateBindingName(input.bindingName);
@@ -4179,144 +4227,72 @@ async function runAgentPass(
     }
   };
 
-  // Every request of this pass leads with the system prompt and the tools.
-  let leadingSystemMessage: SystemMessage = {
-    ...systemMessage, toolsAdded: toolList.map(toToolDeclaration),
-  };
-  // A checkpoint Anthropic wrote reaches a model that can read it as its block, and any other
-  // model as the summary text.
-  let stream = priorConversation !== undefined &&
-      checkpoint?.anthropicCompactionBlock !== undefined &&
-      supportsAnthropicCompaction(handle.model)
-    ? withAnthropicCompactionBlock(
-        handle.stream, checkpoint.anthropicCompactionBlock, priorConversation)
-    : handle.stream;
-
-  // Compaction runs once the tools exist, because Anthropic summarizes the request a turn would
-  // send. Defining the tools has no effects, so nothing has acted when a `/compact` turn returns.
-  let compactionTurn = isCompactionTurn(chatMessages);
-  if (compactionTurn || shouldCompactChat(contextTokens, inputBudget)) {
-    let compactedTo = findCompactionBoundary(
-        projection, inputBudget, contextTokens,
-        checkpoint?.compactedTo, findProtectedFromSequence(chatMessages));
-    if (compactedTo !== undefined) {
-      emitStreamEvent({type: "compacting"});
-      try {
-        let written: Pick<CompactionCheckpoint, "summary" | "anthropicCompactionBlock">;
-        if (supportsAnthropicCompaction(handle.model)) {
-          // The summarized messages are the prompt up to the boundary; the rest stays verbatim.
-          let keptFrom = projection.findIndex(({sequence}) =>
-            sequence !== undefined && sequence >= compactedTo);
-          let {summary, block} = await requestAnthropicCompaction(
-              handle, stream,
-              {messages: [leadingSystemMessage, ...modelMessages.slice(0, keptFrom)]},
-              COMPACTION_SYSTEM_PROMPT, {maxTokens: maxOutputTokens, signal: abortSignal});
-          written = {summary, anthropicCompactionBlock: block};
-        } else {
-          let summaryMessages = buildSummaryPrompt(projection, compactedTo, handle.model);
-          summaryMessages.push({
-            role: "user",
-            content: "Create the context handoff now. Do not continue the conversation.",
-            timestamp: Date.now(),
-          });
-          // Like title generation, this call's usage is deliberately not billed to the chat. It
-          // carries the turn's largest prompt, so it needs the response cap most: without it a
-          // model that charges the response to the same window would reject the request outright.
-          let summary = (await completeText(handle, {
-            systemPrompt: COMPACTION_SYSTEM_PROMPT,
-            messages: summaryMessages,
-            maxTokens: maxOutputTokens,
-            signal: abortSignal,
-          })).trim();
-          // An empty summary would discard the compacted history, so keep the history instead.
-          if (!summary) throw new Error("Compaction produced an empty summary.");
-          written = {summary};
-        }
-
-        let compacted: CompactionCheckpoint = {
-          chatId,
-          compactedTo,
-          ...written,
-          workspacePrompt: systemPromptWorkspace,
-          alwaysAvailableResources: [
-            ...seenAlwaysAvailableResources(listedResources, chatMessages, compactedTo).values(),
-          ],
-          ...buildCompactionState(
-              chatMessages,
-              compactedTo,
-              seedBindings.map<[string, ChatBindingEntry]>(seed => [
-                seed.name,
-                {type: "workpiece", id: seed.target},
-              ]),
-              checkpoint),
-        };
-        return {type: "compacted", checkpoint: compacted};
-      } catch (error) {
-        // Compaction triggers below the limit, so the turn's own prompt still fits and a failed
-        // summary must not fail the turn. Cancellation and an explicit `/compact` do surface.
-        abortSignal.throwIfAborted();
-        if (compactionTurn) throw error;
-        logger.warn("compaction failed; running the turn without it", {
-          event: "agent.compaction.failed", chatId, error,
-        });
-      } finally {
-        emitStreamEvent({type: "compacted"});
-      }
-    } else if (compactionTurn) {
-      // An automatic attempt that finds no boundary just runs the turn, but `/compact` returns
-      // below without prompting the model, so without this the command would do nothing visible.
-      emitStreamEvent({type: "compacted", nothingToCompact: true});
+  // `/compact` asks Pi to summarize the chat's transcript now; the model is never prompted.
+  if (isCompactionTurn(chatMessages)) {
+    emitStreamEvent({type: "compacting"});
+    let compacted = false;
+    try {
+      compacted = await hooks.piChats.compact(chatId, handle);
+    } finally {
+      emitStreamEvent(compacted ? {type: "compacted"} : {type: "compacted", nothingToCompact: true});
     }
-  }
-  // `/compact` ends the turn whether or not the boundary could advance; the model is never prompted.
-  if (compactionTurn) return {type: "finished"};
-
-  if (modelMessages.length === 0 ||
-      modelMessages[modelMessages.length - 1].role === "assistant") {
-    // The log tail ends with a completed assistant response and nothing new has arrived for
-    // the model to answer (e.g. the previous turn crashed between persisting its final message
-    // and finishing), so there is nothing to run. pi's loop requires the context to end with a
-    // user or toolResult message, which replay otherwise guarantees.
-    logger.warn("agent turn skipped: history ends with a completed assistant message", {
-      event: "agent.turn.skipped", chatId,
-    });
     return {type: "finished"};
   }
 
-  // Report the catalogs that changed since the model last saw them. The record is the newest, so
-  // every earlier request stays a prefix of this one. It must not be written before the returns
-  // above: a `/compact` or skipped turn would then no longer be recognized as one.
-  let catalogChanges = findCatalogChanges(
-      seenAlwaysAvailableResources(listedResources, chatMessages, Infinity), currentResources);
-  if (catalogChanges.length > 0) {
-    let sequence = hooks.nextChatSequencePeek(chatId);
-    hooks.addChatMessages(chatId, author, [{type: "catalogChange", resources: catalogChanges}]);
-    replayCatalogChange(sequence, catalogChanges, Date.now());
-  }
-
-  let context: AgentContext = {
-    messages: [leadingSystemMessage, ...modelMessages],
-    tools: toolList,
+  // What Pi's transcript has not taken in yet: the user-side messages the chat log produced
+  // since the last turn handed it inputs. Pi's transcript already holds every earlier request
+  // and every round the model ran.
+  let synced = hooks.piChats.syncedSequence(chatId);
+  let newInputs = () => {
+    let messages: Message[] = [];
+    let last = synced;
+    modelMessages.forEach((message, index) => {
+      let sequence = modelMessageSources[index]?.sequence;
+      if (sequence === undefined || sequence <= synced) return;
+      if (message.role === "user") {
+        messages.push(message);
+      } else if (message.role === "toolResult" && message.toolCallId.startsWith(OBSERVATION_CALL_PREFIX)) {
+        // What the user changed while the agent wasn't running reaches Pi as part of the input.
+        messages.push({role: "user", timestamp: message.timestamp, content: message.content.map(part =>
+            part.type === "text" ? {...part, text: `${USER_CHANGES_OPEN}\n${part.text}\n${USER_CHANGES_CLOSE}`}
+                : part)});
+      } else {
+        return;
+      }
+      last = Math.max(last, sequence);
+    });
+    return {messages, last};
   };
 
-  await runAgentLoopContinue(context, {
-    model: handle.model,
-    // Replay already produces LLM-shaped messages; no custom message types exist. The system
-    // prompt and tool declarations now ride the leading system message in pi's transcript.
-    convertToLlm: (messages) => messages as Message[],
-    toolExecution: "sequential",
-    getSteeringMessages: async () => hooks.takeSteers(chatId).map(
-        text => ({role: "user" as const, content: text, timestamp: Date.now()})),
+  if (newInputs().messages.length > 0) {
+    // Report the catalogs that changed since the model last saw them. The record is the newest,
+    // so it reaches Pi with this turn's inputs. It must not be written for a turn with nothing
+    // new to answer.
+    let catalogChanges = findCatalogChanges(
+        seenAlwaysAvailableResources(listedResources, chatMessages, Infinity), currentResources);
+    if (catalogChanges.length > 0) {
+      let sequence = hooks.nextChatSequencePeek(chatId);
+      hooks.addChatMessages(chatId, author, [{type: "catalogChange", resources: catalogChanges}]);
+      replayCatalogChange(sequence, catalogChanges, Date.now());
+      while (modelMessageSources.length < modelMessages.length) {
+        modelMessageSources.push({sequence, canCut: false});
+      }
+    }
+  }
+  let inputs = newInputs();
+
+  let outcome = await hooks.piChats.drive(chatId, handle, {
+    tools: Object.fromEntries(toolList.map(tool => [tool.name, tool])),
+    emit,
     maxTokens: maxOutputTokens,
+    takeSteering: () => hooks.takeSteers(chatId),
+    resetStream: () => emitStreamEvent({type: "streamReset"}),
     finishTurn: ({message, toolResults}) => {
-      if (message.stopReason === "error" || message.stopReason === "aborted") return;
       capturedActionsForStep = hooks.consumeCapturedActions(chatId);
       if (capturedActionsForStep?.awaitDecision) awaitingActionDecision = true;
-      // The stop reasons that end the turn come first: a compaction reload must not resume work
-      // that one of them ended.
       if (
-          // Cancelled during tool execution: turn_end will persist the completed turn before
-          // this decision ends the loop; don't start another (doomed) model request.
+          // Cancelled during tool execution: the barrier persists the completed round; don't
+          // start another (doomed) model request.
           abortSignal.aborted ||
           // End the turn once the agent has successfully requested a connection: it must wait
           // for the user to respond, not keep reasoning in the meantime. (Accept resumes it on a
@@ -4328,45 +4304,25 @@ async function runAgentPass(
           awaitingActionDecision) {
         return {action: "end"};
       }
-      // The model stopped on its own; there is no next request to make room for.
-      if (toolResults.length === 0) return;
-      // Otherwise the next request is this step's measured prompt plus the tool results just
-      // produced, weighed as the model will see them (pi's `details` can carry a second copy of a
-      // large output). Without usage there is nothing to measure against, so reload: the
-      // turn-start check estimates the whole prompt, as it does for that case there.
-      let measured = message.usage.totalTokens;
-      let next = measured + estimateProjectionTokens(
-          toolResults.map(({details: _, ...message}) => ({message})));
-      if (measured <= 0 || shouldCompactChat(next, inputBudget)) {
-        reloadForCompaction = true;
-        // The rerun's fresh preview manager knows of no active file; end this one's marker here,
-        // as a non-edit tool start would, so it doesn't outlive the run on the client.
-        codePreviewManager.clearActiveFile();
-        return {action: "end"};
-      }
+      void message;
+      void toolResults;
+      return undefined;
     },
-  }, emit, abortSignal, stream);
+  }, {system: getSystemMessageText(systemMessage), messages: inputs.messages, lastSequence: inputs.last},
+  abortSignal);
 
-  // (No end-of-turn flush: every completed step's effects were barrier-committed with its
-  // message, and an abort simply drops the in-flight step's buffer -- nothing durable exists
-  // for it. Cancellation stops the agent, it does not revert the turn; completed steps' work
-  // stays, and the user reverts explicitly if they want it gone.)
-
-  // Cancellation surfaces as the abort reason, matching the old thrown-abort behavior. (Checked
-  // outside turnFailure because an abort during tool execution stops the loop after a persisted,
-  // *completed* turn -- no failed model request happened.)
+  // Cancellation surfaces as the abort reason. Completed rounds' work stays; the user reverts
+  // explicitly if they want it gone.
   abortSignal.throwIfAborted();
 
-  if (turnFailure) {
-    // Other failures become an AgentTurnError carrying the failing request's HTTP status (when
-    // it can be determined) for the overseer's triage; runAgent retries a transient one first.
-    let message = turnFailure.errorMessage ?? "The model request failed.";
-    let error = new AgentTurnError(message, httpStatusFromError(message, handle.lastResponse));
-    if (isRetryableAssistantError(turnFailure)) return {type: "transientFailure", error};
-    throw error;
+  if (outcome.type === "failed") {
+    // Pi has already retried what it could; a failed run becomes an AgentTurnError carrying the
+    // failing request's HTTP status (when it can be determined) for the overseer's triage.
+    let message = outcome.message?.errorMessage ?? outcome.reason;
+    throw new AgentTurnError(message, httpStatusFromError(message, handle.lastResponse));
   }
 
-  return {type: reloadForCompaction ? "reloadForCompaction" : "finished"};
+  return {type: "finished"};
 }
 
 /**

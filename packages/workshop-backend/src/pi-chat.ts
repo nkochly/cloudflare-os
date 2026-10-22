@@ -1,59 +1,94 @@
-import { Workspace } from "@cloudflare/computer";
-import { WorkerJavaScriptBackend } from "@cloudflare/computer/backends/worker-javascript";
-import { createPiTools, type PiTool } from "@cloudflare/computer/tools/pi-ai";
-import { Type, type Api, type Model } from "@earendil-works/pi-ai";
+import {
+  createAssistantMessageEventStream, type Api, type AssistantMessage, type AssistantMessageEvent, type Message,
+  type ImageContent, type Model, type TextContent, type ToolResultMessage,
+} from "@earendil-works/pi-ai";
 import { createModels, createProvider } from "@earendil-works/pi-ai/models";
-import { createRegistry, defineExtension, Harness, section, type ToolRegistration } from "@earendil-works/pi-durable";
+import {
+  createRegistry, defineExtension, GenerationTask, Harness, hook, section, type ToolRegistration,
+} from "@earendil-works/pi-durable";
+import type { AgentEvent, AgentTool } from "@earendil-works/pi-agent-core";
 import { PiHarness } from "agents/harness/pi";
-import type { AiChatAuthorInfo, WorkpieceId } from "@gadgets/workshop-shared/api";
-import type { CodeChange, FileChange } from "@gadgets/workshop-shared/code-change";
-import type { AgentGadgetInfo, AgentStepChange, ChatHistory } from "./agent";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+/** The calling context, to run callbacks in later (workerd implements Node's snapshot()). */
+const snapshotContext = (): (<R>(fn: () => R) => R) =>
+  (AsyncLocalStorage as unknown as {snapshot(): <R>(fn: () => R) => R}).snapshot();
+import { AGENT_TOOL_DECLARATIONS } from "./agent";
 import type { ModelHandle } from "./ai-models";
+import { PDF_MIME_TYPE } from "./chat-attachment-pdf";
+import { canInlineChatAttachmentImage } from "./chat-attachment-validation";
 
 /**
- * Chat turns on pi-durable, hosted by the Agents SDK's PiHarness.
+ * Every chat turn runs on pi-durable, hosted by the Agents SDK's PiHarness.
  *
- * Pi owns the turn: one Pi session per chat holds the transcript, the inbox and the run, and
- * resumes it after an eviction. The chat's draft is a folder in a computer Workspace,
- * `/chats/<chatId>/`, with one subfolder per gadget; the file tools are computer's, rooted there.
- * When a run settles, the draft is diffed against the chat's view of each gadget and lands in the
- * chat as one agent step, with Pi's answer as its message. That step is what the chat log, the
- * UI and `mergeChanges` read, so the chat log is a projection of Pi's runs, written once per run.
+ * Pi owns the run: one Pi session per chat holds the model transcript, the inbox and the run,
+ * makes the model requests, executes the tool calls durably, compacts the transcript when it
+ * nears the model's window, and resumes the run after an eviction. The chat log is the product's
+ * record of what the agent did: each completed round is written to it at the round's barrier
+ * (`afterTools`, or `onYield` for the final answer) by the turn attached to the run.
+ *
+ * A turn attaches a `PiPass`: the tools' implementations (which close over the chat's session
+ * content, pins, worktrees, connections and captured gatekeeper actions) and the event sink that
+ * streams to clients and persists each round. The tools Pi sees are static declarations
+ * (AGENT_TOOL_DECLARATIONS) that call into the attached pass. A run Pi wakes after an eviction
+ * waits for the Overseer's restart recovery to attach a turn again before its next call.
  */
 
-/** The pi-ai provider id every workshop model is registered under for Pi. */
+/** The prefix of the pi-ai provider id each chat's model is registered under for Pi. */
 export const PI_PROVIDER = "workshop";
 
-const MANIFEST = ".workshop.json";
-/** Where the model sees its chat's draft. */
-const WORKSPACE = "/workspace";
-const FILE_TOOLS = ["read", "write", "edit", "ls", "find", "grep", "delete"];
+/** chord's background context (no values, never cancelled), which pi-durable takes on every call. */
+const BACKGROUND = Object.freeze({
+  abortSignal: undefined, value: () => undefined, toString: () => "[Context workshop background]",
+}) as never;
 
-/** What a draft folder holds, by folder name: an existing gadget (id) or one the run created. */
-type Manifest = {gadgets: Record<string, {id?: WorkpieceId; title: string}>};
+/** How long a woken run waits for a turn to attach before its tool calls fail. */
+const ATTACH_TIMEOUT_MS = 60_000;
 
-/** The Overseer operations a Pi turn needs. */
-export interface PiChatHooks {
-  loadChatHistory(chatId: number): ChatHistory;
-  listGadgetInfo(forChatId: number): AgentGadgetInfo[];
-  readGadgetFiles(gadgetId: WorkpieceId, chatId?: number): Promise<ReadonlyMap<string, string>>;
-  getGadgetHead(gadgetId: WorkpieceId): string | undefined;
-  createGadget(title: string, bindingName: string, chatId: number): {id: WorkpieceId; title: string};
-  commitAgentStep(chatId: number, author: AiChatAuthorInfo,
-      msgs: {type: "message"; message: string}[],
-      step: {
-        changes: AgentStepChange[];
-        createdGadgets: {gadgetId: WorkpieceId; title: string; bindingName: string}[];
-        createdWorktrees: never[];
-        addedBindings: never[];
-        worktreeCommits: never[];
-        blueprintMerges: never[];
-      }): Promise<boolean>;
+/** What one attached turn gives Pi: the tools' implementations and the round barrier. */
+export interface PiPass {
+  tools: Record<string, AgentTool>;
+  /** The client stream and persistence sink: message_update, tool_execution_end, turn_end. */
+  emit(event: AgentEvent): Promise<void>;
+  /** Decides after a round's tools whether the run ends there, before another request. */
+  finishTurn(round: {message: AssistantMessage; toolResults: ToolResultMessage[]}): {action: "end"} | undefined | void;
+  /** Tells clients to drop what a failed request streamed; Pi may retry it. */
+  resetStream(): void;
+  /** Steering the user sent while the turn ran, joined after the current round. */
+  takeSteering(): string[];
+  maxTokens?: number;
 }
+
+/** How a driven turn ended. */
+export type PiTurnOutcome =
+  | {type: "finished"}
+  | {type: "failed"; message: AssistantMessage | undefined; reason: string};
+
+type Attached = {
+  pass: PiPass;
+  /**
+   * Runs a callback in the turn's own context. Pi makes requests and calls tools from its own
+   * session line; running them in the turn's context keeps them in the turn's trace span and
+   * logging context, as they were when the turn made them itself.
+   */
+  inTurn: <R>(fn: () => R) => R;
+  handle: ModelHandle;
+  /** The assistant message of the round in flight, as the provider finished it. */
+  assistant?: AssistantMessage;
+  /** Tool results of the round in flight, by call id. */
+  results: Map<string, ToolResultMessage>;
+  /** The round's stop decision, made once its last call returned. */
+  decision?: {action: "end"} | undefined | void;
+  decided: boolean;
+  ended: boolean;
+  failure?: AssistantMessage;
+  /** A throw from the turn's own sink, e.g. a failed persistence barrier: it fails the turn. */
+  error?: {thrown: unknown};
+};
 
 /**
  * PiHarness opens pi at every start to wake sessions with unfinished work. A workspace whose
- * chats have never run on Pi has none, so it starts without opening pi at all.
+ * chats have never run has none, so it starts without opening pi at all.
  */
 class LazyPiHarness extends PiHarness {
   readonly #hasSessions: () => boolean;
@@ -68,26 +103,32 @@ class LazyPiHarness extends PiHarness {
 
 export class PiChats {
   readonly harness: PiHarness;
-  readonly workspace: Workspace;
   readonly #sql: SqlStorage;
   readonly #models = createModels();
+  readonly #attached = new Map<number, Attached>();
+  readonly #waiters = new Map<number, (() => void)[]>();
+  readonly #tools: ToolRegistration[];
+  /**
+   * Runs a callback in the object's own context. Pi's run and its wake job outlive the turn that
+   * submits to them, so submitting must not tie them to that turn's trace span.
+   */
+  readonly #detached = snapshotContext();
 
-  readonly #storage: DurableObjectStorage;
-  readonly #loader: WorkerLoader | undefined;
-  readonly #chatWorkspaces = new Map<number, Workspace>();
-
-  constructor(ctx: DurableObjectState, loader?: WorkerLoader) {
-    this.#storage = ctx.storage;
-    this.#loader = loader;
+  constructor(ctx: DurableObjectState) {
     this.#sql = ctx.storage.sql;
+    // `system` is the system prompt the chat's turn last set; Pi renders it before every request.
     this.#sql.exec(`CREATE TABLE IF NOT EXISTS workshop_pi_chat (
-      chat_id INTEGER PRIMARY KEY, session TEXT NOT NULL, synced_sequence INTEGER NOT NULL)`);
-    this.workspace = new Workspace({storage: ctx.storage, output: false});
+      chat_id INTEGER PRIMARY KEY, session TEXT NOT NULL, synced_sequence INTEGER NOT NULL,
+      system TEXT NOT NULL DEFAULT '')`);
+    let extension = this.#extension();
+    this.#tools = [...extension.tools ?? []];
     let registry = createRegistry();
-    registry.install(this.#extension());
+    registry.install(extension);
     this.harness = new LazyPiHarness(() => this.#hasChats(), {
-      harness: ({storage, context}) => Harness.open(storage, {models: this.#models, registry,
-        onReport: error => console.error(JSON.stringify({event: "pi.report", error: String(error)}))}, context),
+      harness: ({storage, context}) => Harness.open(storage, {
+        models: this.#models, registry, settings: {toolExecution: "sequential"},
+        onReport: error => console.error(JSON.stringify({event: "pi.report", error: String(error)})),
+      }, context),
     });
   }
 
@@ -95,250 +136,336 @@ export class PiChats {
     return this.#sql.exec("SELECT 1 FROM workshop_pi_chat LIMIT 1").toArray().length > 0;
   }
 
-  /** The draft folder of a chat. */
-  static folder(chatId: number): string {
-    return `/chats/${chatId}`;
+  /** The chat log sequence Pi's transcript has taken in up to; -1 for a chat Pi has not run. */
+  syncedSequence(chatId: number): number {
+    return this.#sql.exec<{synced_sequence: number}>(
+        "SELECT synced_sequence FROM workshop_pi_chat WHERE chat_id = ?", chatId)
+        .toArray()[0]?.synced_sequence ?? -1;
+  }
+
+  /** The chat's Pi session, if it has run on Pi. */
+  sessionOf(chatId: number): string | undefined {
+    return this.#sql.exec<{session: string}>(
+        "SELECT session FROM workshop_pi_chat WHERE chat_id = ?", chatId).toArray()[0]?.session;
   }
 
   /**
-   * Runs one turn: submits the chat's unanswered messages to its Pi session, waits for Pi to
-   * settle them, and lands the draft in the chat. Submitting is idempotent per message, so a
-   * turn the Overseer resumes after an eviction waits on the same Pi run instead of starting one.
+   * Starts the chat's model context over: the next turn opens a new Pi session that takes in the
+   * whole chat log again. Used when the log no longer matches what Pi saw (a rewind or reroot).
    */
-  async runTurn(hooks: PiChatHooks, handle: ModelHandle, chatId: number, author: AiChatAuthorInfo,
-      signal: AbortSignal): Promise<void> {
-    let model = this.#useModel(handle);
-    let {session, syncedSequence} = await this.#session(hooks, chatId, model);
-
-    let pending = hooks.loadChatHistory(chatId).chatMessages.filter(m =>
-        m.sequence > syncedSequence && m.type === "message" && m.author.type !== "agent");
-    if (pending.length === 0) return;
-    let last = pending[pending.length - 1].sequence;
-    let prompt = pending.map(m => (m as {message: string}).message).join("\n\n");
-
-    let receipt = await this.harness.session(session).submit(prompt, {operationId: `chat-${chatId}-${last}`});
-    let result = await this.harness.session(session).wait(receipt.operationId, signal);
-    signal.throwIfAborted();
-    if (result.status !== "done") {
-      // pi records a failed request on the transcript's last assistant entry.
-      let last = (await this.harness.session(session).messages()).at(-1) as {data?: {errorMessage?: string}} | undefined;
-      throw new Error([result.reason ?? "The model did not answer.", last?.data?.errorMessage].filter(Boolean).join(": "));
-    }
-
-    await this.#land(hooks, chatId, author, result.text ?? "");
-    this.#sql.exec("UPDATE workshop_pi_chat SET synced_sequence = ? WHERE chat_id = ?", last, chatId);
+  forget(chatId: number) {
+    this.#sql.exec("DELETE FROM workshop_pi_chat WHERE chat_id = ?", chatId);
   }
 
-  /** Registers the turn's model with Pi's catalog under PI_PROVIDER, streaming through the handle. */
-  #useModel(handle: ModelHandle): Model<Api> {
-    let model = {...handle.model, provider: PI_PROVIDER} as Model<Api>;
+  /**
+   * Drives one turn on the chat's Pi session: hands Pi the chat's new inputs (the model messages
+   * the chat log produced after `syncedSequence`, up to `lastSequence`) and waits until Pi
+   * settles them. Submitting is idempotent per input, so a turn restarted after an eviction
+   * waits on the run Pi resumed instead of starting another. With no new inputs it waits on the
+   * run still in flight, if any.
+   */
+  async drive(chatId: number, handle: ModelHandle, pass: PiPass, input: {
+    system: string; messages: Message[]; lastSequence: number;
+  }, signal: AbortSignal): Promise<PiTurnOutcome> {
+    let model = this.#useModel(chatId, handle);
+    let session = await this.#detached(() => this.#session(chatId, model, input.system));
+    let attached: Attached = {pass, handle, inTurn: snapshotContext(), results: new Map(), decided: false, ended: false};
+    this.#attached.set(chatId, attached);
+    for (let wake of this.#waiters.get(chatId) ?? []) wake();
+    this.#waiters.delete(chatId);
+    // The model is offered exactly the tools this turn implements (a spawned agent gets fewer).
+    let offered = this.#tools.filter(tool => Object.hasOwn(pass.tools, tool.name));
+    if (offered.length !== this.#tools.length) {
+      await this.#detached(async () =>
+          (await this.harness.conversation(session)).configure({modelTools: offered}, BACKGROUND));
+    }
+    let onAbort = () => void this.harness.session(session).abort().catch(() => {});
+    signal.addEventListener("abort", onAbort);
+    try {
+      let operationId: string | undefined;
+      if (input.messages.length > 0) {
+        let receipt = await this.#detached(() => this.harness.session(session).submit(
+            toUserInput(input.messages), {operationId: `chat-${chatId}-${input.lastSequence}`}));
+        operationId = receipt.operationId;
+        this.#sql.exec("UPDATE workshop_pi_chat SET synced_sequence = ? WHERE chat_id = ?",
+            input.lastSequence, chatId);
+      } else {
+        operationId = (await this.#detached(() => this.harness.pending({session}))).at(-1)?.operationId;
+        if (!operationId) return {type: "finished"};
+      }
+      let waitFor = operationId;
+      let result = await this.#detached(() => this.harness.session(session).wait(waitFor, signal));
+      signal.throwIfAborted();
+      if (attached.error) throw attached.error.thrown;
+      if (result.status === "done" || attached.ended) return {type: "finished"};
+      return {type: "failed", message: attached.failure, reason: result.reason ?? "The model did not answer."};
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      if (this.#attached.get(chatId) === attached) this.#attached.delete(chatId);
+    }
+  }
+
+  /**
+   * `/compact`: Pi summarizes the older part of the chat's transcript now, as it does on its own
+   * when a request nears the model's window. False when the chat has no Pi session yet.
+   */
+  async compact(chatId: number, handle: ModelHandle): Promise<boolean> {
+    let session = this.sessionOf(chatId);
+    if (!session) return false;
+    await this.harness.session(session).setModel(this.#useModel(chatId, handle));
+    let pi = await this.harness.pi();
+    let task = await (await this.harness.conversation(session)).compact(undefined, BACKGROUND);
+    let settled = await pi.waitForTask(task, BACKGROUND) as {outcome?: {result?: {entryId?: string}}};
+    return settled.outcome?.result?.entryId !== undefined;
+  }
+
+  /** The turn attached to a chat, waiting a while for one when a woken run gets ahead of it. */
+  async #attachedTo(chatId: number): Promise<Attached> {
+    let attached = this.#attached.get(chatId);
+    if (attached) return attached;
+    await new Promise<void>((resolve, reject) => {
+      let timer = setTimeout(() => reject(new Error(
+          "This turn was interrupted and could not be resumed.")), ATTACH_TIMEOUT_MS);
+      let list = this.#waiters.get(chatId) ?? [];
+      list.push(() => { clearTimeout(timer); resolve(); });
+      this.#waiters.set(chatId, list);
+    });
+    return this.#attached.get(chatId)!;
+  }
+
+  /**
+   * Registers the chat's model with Pi's catalog under its own provider id. Requests stream
+   * through the attached turn's handle, and every event also feeds the turn's client stream.
+   */
+  #useModel(chatId: number, handle: ModelHandle): Model<Api> {
+    let provider = `${PI_PROVIDER}-${chatId}`;
+    let model = {...handle.model, provider} as Model<Api>;
+    let stream = (m: Model<Api>, context: never, options: Record<string, unknown> | undefined) => {
+      let attached = this.#attached.get(chatId);
+      let target = attached?.handle ?? handle;
+      let request = context as unknown as {messages: Message[]};
+      context = {...request, messages: limitRequestImages(request.messages)} as never;
+      if (!attached) return target.stream({...target.model, id: m.id} as never, context, options as never);
+      let source = attached.inTurn(() => target.stream({...target.model, id: m.id} as never, context,
+          {...options, maxTokens: attached.pass.maxTokens} as never));
+      let out = createAssistantMessageEventStream();
+      void (async () => {
+        try {
+          for await (let event of source) {
+            if (event.type === "done") attached.assistant = event.message;
+            let partial = "partial" in event ? event.partial
+                : event.type === "done" ? event.message : event.type === "error" ? event.error : undefined;
+            await attached.pass.emit({type: "message_update", message: partial as never,
+              assistantMessageEvent: event as AssistantMessageEvent});
+            out.push(event);
+          }
+          out.end();
+        } catch (error) {
+          let message = {...emptyAssistant(target.model), stopReason: "error", errorMessage: String(error)};
+          out.push({type: "error", reason: "error", error: message} as never);
+          out.end();
+        }
+      })();
+      return out;
+    };
     this.#models.setProvider(createProvider({
-      id: PI_PROVIDER,
+      id: provider,
       // The handle carries its own credentials; Pi resolves none.
       auth: {apiKey: {name: "Workshop", resolve: async () => ({auth: {}})}} as never,
       models: [model],
-      api: {
-        stream: (m: Model<Api>, context: never, options: never) =>
-          handle.stream({...handle.model, id: m.id} as never, context, options),
-        streamSimple: (m: Model<Api>, context: never, options: never) =>
-          handle.stream({...handle.model, id: m.id} as never, context, options),
-      } as never,
+      api: {stream, streamSimple: stream} as never,
     }));
     return model;
   }
 
-  async #session(hooks: PiChatHooks, chatId: number, model: Model<Api>)
-      : Promise<{session: string; syncedSequence: number}> {
-    let row = this.#sql.exec<{session: string; synced_sequence: number}>(
-        "SELECT session, synced_sequence FROM workshop_pi_chat WHERE chat_id = ?", chatId).toArray()[0];
-    if (row) {
-      await this.harness.session(row.session).setModel(model);
-      return {session: row.session, syncedSequence: row.synced_sequence};
+  async #session(chatId: number, model: Model<Api>, system: string): Promise<string> {
+    let session = this.sessionOf(chatId);
+    if (session) {
+      this.#sql.exec("UPDATE workshop_pi_chat SET system = ? WHERE chat_id = ?", system, chatId);
+      await this.harness.session(session).setModel(model);
+      return session;
     }
+    let created = await this.harness.sessions.create();
+    await created.setModel(model);
+    this.#sql.exec("INSERT INTO workshop_pi_chat (chat_id, session, synced_sequence, system) VALUES (?, ?, ?, ?)",
+        chatId, created.id, -1, system);
+    return created.id;
+  }
 
-    // A new chat's draft starts as its current view of every gadget it can see.
-    let manifest: Manifest = {gadgets: {}};
-    let dir = PiChats.folder(chatId);
-    for (let info of hooks.listGadgetInfo(chatId)) {
-      let name = `g${info.id}`;
-      manifest.gadgets[name] = {id: info.id, title: info.title};
-      for (let [path, content] of await hooks.readGadgetFiles(info.id, chatId)) {
-        await this.#write(`${dir}/${name}/${path}`, content);
-      }
+  #chatOf(session: string): number | undefined {
+    return this.#sql.exec<{chat_id: number}>(
+        "SELECT chat_id FROM workshop_pi_chat WHERE session = ?", session).toArray()[0]?.chat_id;
+  }
+
+  /** Makes the round's stop decision once every call the round made has a result. */
+  #decide(attached: Attached) {
+    let message = attached.assistant;
+    if (!message || attached.decided) return;
+    let calls = message.content.filter(c => c.type === "toolCall");
+    if (calls.some(c => !attached.results.has(c.id))) return;
+    attached.decided = true;
+    attached.decision = attached.pass.finishTurn({message, toolResults: calls.map(c => attached.results.get(c.id)!)});
+    if (attached.decision?.action === "end") attached.ended = true;
+  }
+
+  /** Writes the round Pi just finished to the chat log through the attached turn's barrier. */
+  async #barrier(attached: Attached) {
+    let message = attached.assistant;
+    if (!message) return;
+    if (message.stopReason === "error" || message.stopReason === "aborted") {
+      attached.failure = message;
+      attached.assistant = undefined;
+      return;
     }
-    await this.#write(`${dir}/${MANIFEST}`, JSON.stringify(manifest));
-
-    let session = await this.harness.sessions.create();
-    await session.setModel(model);
-    // Messages already in the chat before Pi took it over are not replayed into the session.
-    let before = hooks.loadChatHistory(chatId).chatMessages
-        .filter(m => m.type === "message" && m.author.type === "agent").at(-1)?.sequence ?? -1;
-    this.#sql.exec("INSERT INTO workshop_pi_chat (chat_id, session, synced_sequence) VALUES (?, ?, ?)",
-        chatId, session.id, before);
-    return {session: session.id, syncedSequence: before};
-  }
-
-  /** Lands the draft in the chat as one step: new gadgets, every changed file, and the answer. */
-  async #land(hooks: PiChatHooks, chatId: number, author: AiChatAuthorInfo, answer: string) {
-    let dir = PiChats.folder(chatId);
-    let manifest = await this.#manifest(chatId);
-    let createdGadgets: {gadgetId: WorkpieceId; title: string; bindingName: string}[] = [];
-    let changes: AgentStepChange[] = [];
-
-    for (let [name, entry] of Object.entries(manifest.gadgets)) {
-      let id = entry.id;
-      if (id === undefined) {
-        let created = hooks.createGadget(entry.title, name, chatId);
-        id = entry.id = created.id;
-        createdGadgets.push({gadgetId: id, title: created.title, bindingName: name});
-      }
-      let draft = await this.#readTree(`${dir}/${name}`);
-      let current = createdGadgets.some(g => g.gadgetId === id)
-          ? new Map<string, string>() : await hooks.readGadgetFiles(id, chatId);
-      let edits: [string, FileChange][] = [];
-      for (let [path, content] of draft) {
-        if (current.get(path) !== content) edits.push([path, {set: content}]);
-      }
-      for (let path of current.keys()) {
-        if (!draft.has(path)) edits.push([path, {remove: true}]);
-      }
-      if (edits.length === 0) continue;
-      let head = hooks.getGadgetHead(id);
-      let change: CodeChange = {[id]: edits};
-      changes.push(head !== undefined ? {change, pin: {gadgetId: id, baseCommit: head}} : {change});
+    let calls = message.content.filter(c => c.type === "toolCall");
+    for (let call of calls) {
+      if (attached.results.has(call.id)) continue;
+      // Pi refused the call before it reached a tool (an unknown name, invalid arguments).
+      let text = "The call was rejected before it ran.";
+      this.#record(attached, call.id, call.name, text, true);
+      await attached.inTurn(() => attached.pass.emit({type: "tool_execution_end", toolCallId: call.id,
+        toolName: call.name, result: {content: [{type: "text", text}]}, isError: true}));
     }
-
-    await hooks.commitAgentStep(chatId, author, [{type: "message", message: answer}], {
-      changes, createdGadgets, createdWorktrees: [], addedBindings: [], worktreeCommits: [], blueprintMerges: [],
-    });
-    await this.#write(`${dir}/${MANIFEST}`, JSON.stringify(manifest));
-  }
-
-  async #manifest(chatId: number): Promise<Manifest> {
-    let text = await this.workspace.fs.readFile(`${PiChats.folder(chatId)}/${MANIFEST}`, "utf8").catch(() => undefined);
-    return text ? JSON.parse(text as string) : {gadgets: {}};
-  }
-
-  async #write(path: string, content: string) {
-    await this.workspace.fs.mkdir(path.slice(0, path.lastIndexOf("/")), {recursive: true});
-    await this.workspace.fs.writeFile(path, content);
-  }
-
-  async #readTree(root: string, prefix = ""): Promise<Map<string, string>> {
-    let files = new Map<string, string>();
-    let entries = await this.workspace.fs.readdir(root + (prefix ? `/${prefix}` : "")).catch(() => []);
-    for (let entry of entries) {
-      let rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory) {
-        for (let [p, c] of await this.#readTree(root, rel)) files.set(p, c);
-      } else {
-        files.set(rel, await this.workspace.fs.readFile(`${root}/${rel}`, "utf8") as string);
-      }
+    this.#decide(attached);
+    let toolResults = calls.map(c => attached.results.get(c.id)!);
+    attached.assistant = undefined;
+    attached.results.clear();
+    attached.decided = false;
+    try {
+      await attached.inTurn(() => attached.pass.emit({type: "turn_end", message, toolResults}));
+    } catch (thrown) {
+      // Nothing of a round that failed to persist may run on: end the run and fail the turn.
+      attached.error ??= {thrown};
+      attached.ended = true;
     }
-    return files;
   }
 
-  /**
-   * The chat's draft as its own Workspace, for `exec`: a JavaScript module runs in a fresh Dynamic
-   * Worker (computer's WorkerJavaScriptBackend) with `node:fs` rooted at the draft folder, so code
-   * the model runs sees and changes exactly the files the file tools do. It has no network.
-   */
-  #execWorkspace(chatId: number): Workspace | undefined {
-    if (!this.#loader) return undefined;
-    let ws = this.#chatWorkspaces.get(chatId);
-    if (!ws) {
-      ws = new Workspace({storage: this.#storage, output: false, backends: [new WorkerJavaScriptBackend({
-        loader: this.#loader as never, root: PiChats.folder(chatId), globalOutbound: null,
-      })]});
-      this.#chatWorkspaces.set(chatId, ws);
-    }
-    return ws;
-  }
-
-  #chatOf(session: string): number {
-    let row = this.#sql.exec<{chat_id: number}>(
-        "SELECT chat_id FROM workshop_pi_chat WHERE session = ?", session).toArray()[0];
-    if (!row) throw new Error("This conversation is not a workshop chat.");
-    return row.chat_id;
-  }
-
-  /** The workshop's tools: computer's file tools over the chat's draft, and createGadget. */
+  /** The workshop's tools, its system prompt section and the round barrier. */
   #extension() {
-    let declarations = createPiTools({workspace: this.workspace, root: "/", exec: {}}).tools
-        .filter(tool => FILE_TOOLS.includes(tool.name));
-    let fileTools = declarations.map((tool: PiTool): ToolRegistration => ({
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters as never,
+    let tools = Object.values(AGENT_TOOL_DECLARATIONS).map((declaration): ToolRegistration => ({
+      name: declaration.name,
+      description: declaration.description,
+      parameters: declaration.parameters as never,
       execute: async (args, api, context) => {
-        // The model sees the chat's draft as /workspace; the tools see its real folder.
-        let root = PiChats.folder(this.#chatOf(String(api.conversationId)));
-        let inRoot = (path: unknown) => typeof path === "string"
-            ? root + path.replace(/^\/workspace(?=\/|$)/, "").replace(/^(?!\/)/, "/") : path;
-        let call = {...args as Record<string, unknown>};
-        for (let key of ["path", "file_path"]) if (key in call) call[key] = inRoot(call[key]);
-        let result = await createPiTools({workspace: this.workspace, root, exec: {}})
-            .execute({id: api.callId, name: tool.name, arguments: call}, {abortSignal: context.abortSignal});
-        let content = result.content.map(c => c.type === "text" ? {...c, text: c.text.replaceAll(root, WORKSPACE)} : c);
-        if (result.isError) throw new Error(content.map(c => c.type === "text" ? c.text : "").join("\n"));
-        return {output: content};
+        let chatId = this.#chatOf(String(api.conversationId));
+        if (chatId === undefined) throw new Error("This conversation is not a workshop chat.");
+        let attached = await this.#attachedTo(chatId);
+        let tool = attached.pass.tools[declaration.name];
+        let result: {content: ToolResultMessage["content"]; details?: unknown};
+        let isError = false;
+        try {
+          if (!tool) throw new Error(`${declaration.name} is not available in this conversation.`);
+          result = await attached.inTurn(() =>
+              tool.execute(api.callId, args as never, context.abortSignal as AbortSignal | undefined));
+        } catch (error) {
+          isError = true;
+          result = {content: [{type: "text", text: error instanceof Error ? error.message : String(error)}]};
+        }
+        this.#record(attached, api.callId, declaration.name, result.content, isError, result.details);
+        await attached.inTurn(() => attached.pass.emit({type: "tool_execution_end", toolCallId: api.callId,
+          toolName: declaration.name, result, isError}));
+        this.#decide(attached);
+        return {output: result.content, isError, ...attached.ended ? {control: {terminate: true}} : {}};
       },
     }));
 
-    let CreateGadget = Type.Object({
-      title: Type.String({description: "The gadget's title."}),
-      bindingName: Type.String({description: "Folder and binding name, upper case, e.g. DEALS."}),
-    });
-    let createGadget: ToolRegistration<typeof CreateGadget> = {
-      name: "createGadget",
-      description: "Create a new gadget. Its files live in the folder named by bindingName.",
-      parameters: CreateGadget,
-      replay: "safe",
-      execute: async ({title, bindingName}, api) => {
-        if (!/^[A-Z][A-Z0-9_]*$/.test(bindingName)) throw new Error("bindingName must be upper case.");
-        let chatId = this.#chatOf(String(api.conversationId));
-        let manifest = await this.#manifest(chatId);
-        if (manifest.gadgets[bindingName]) throw new Error(`${bindingName} already exists.`);
-        manifest.gadgets[bindingName] = {title};
-        await this.workspace.fs.mkdir(`${PiChats.folder(chatId)}/${bindingName}`, {recursive: true});
-        await this.#write(`${PiChats.folder(chatId)}/${MANIFEST}`, JSON.stringify(manifest));
-        return {output: [{type: "text", text: `Created ${bindingName}. Write its files under ${WORKSPACE}/${bindingName}/.`}]};
-      },
-    };
-
-    // The exec tool is declared once; each call runs on the calling chat's own backend.
-    let execDeclaration = this.#loader && createPiTools({workspace: this.#execWorkspace(0)!,
-      exec: {"worker-javascript": {}}}).tools.find(tool => tool.name === "exec");
-    let exec: ToolRegistration[] = !this.#loader || !execDeclaration ? [] : [{
-      name: "exec",
-      description: execDeclaration.description,
-      parameters: execDeclaration.parameters as never,
-      execute: async (args, api, context) => {
-        // Code runs in the draft folder: relative paths name the same files the file tools show
-        // under /workspace.
-        let root = PiChats.folder(this.#chatOf(String(api.conversationId)));
-        let call = {...args as Record<string, unknown>};
-        let cwd = typeof call.cwd === "string" ? call.cwd.replace(/^\/workspace(?=\/|$)/, "") : "";
-        call.cwd = root + (cwd && !cwd.startsWith("/") ? `/${cwd}` : cwd);
-        let result = await createPiTools({workspace: this.#execWorkspace(Number(root.split("/").at(-1)))!,
-          exec: {"worker-javascript": {}}})
-            .execute({id: api.callId, name: "exec", arguments: call}, {abortSignal: context.abortSignal});
-        let content = result.content.map(c => c.type === "text" ? {...c, text: c.text.replaceAll(root, WORKSPACE)} : c);
-        if (result.isError) throw new Error(content.map(c => c.type === "text" ? c.text : "").join("\n"));
-        return {output: content};
-      },
-    }];
-
     return defineExtension({
       name: "workshop",
-      sections: [section("workshop", () => [
-        "You build gadgets in a workspace. Each gadget is a folder; its server code is server.js,",
-        "exporting a Durable Object class Gadget and, for exports, a WorkerEntrypoint ExportHandler.",
-        "Create a gadget with createGadget, then write its files under /workspace/<bindingName>/.",
-        "Existing gadgets are the other folders in /workspace.",
-        "Code you run with exec starts in /workspace: use relative paths there, e.g. DEALS/server.js.",
-      ].join("\n"))],
-      tools: [...fileTools, ...exec, createGadget as unknown as ToolRegistration],
+      sections: [section("workshop", ({conversationId}) => this.#sql.exec<{system: string}>(
+          "SELECT system FROM workshop_pi_chat WHERE session = ?", String(conversationId))
+          .toArray()[0]?.system || undefined, {tag: false})],
+      tools,
+      hooks: [hook(GenerationTask, {
+        afterResponse: (message, api) => {
+          let attached = this.#attachedFor(String(api.conversationId));
+          if (!attached) return;
+          if (message.stopReason === "error" || message.stopReason === "aborted") {
+            // Nothing of a failed request is kept; Pi retries it or fails the run with it.
+            attached.failure = message;
+            attached.assistant = undefined;
+            attached.pass.resetStream();
+            return;
+          }
+          attached.assistant = message;
+        },
+        afterTools: async (_assistant, _results, api) => {
+          let session = String(api.conversationId);
+          let attached = this.#attachedFor(session);
+          if (!attached) return;
+          await this.#barrier(attached);
+          if (attached.ended) {
+            void this.harness.session(session).abort().catch(() => {});
+            return;
+          }
+          // Steering joins after this round, as the user's own words.
+          let steering = attached.pass.takeSteering();
+          if (steering.length > 0) {
+            void this.harness.session(session).steer(steering.join("\n\n")).catch(() => {});
+          }
+        },
+        onYield: async (_answer, api) => {
+          let attached = this.#attachedFor(String(api.conversationId));
+          if (attached) await this.#barrier(attached);
+          return undefined;
+        },
+      })],
     });
   }
+
+  #attachedFor(session: string): Attached | undefined {
+    let chatId = this.#chatOf(session);
+    return chatId === undefined ? undefined : this.#attached.get(chatId);
+  }
+
+  #record(attached: Attached, toolCallId: string, toolName: string,
+      content: ToolResultMessage["content"] | string, isError: boolean, details?: unknown) {
+    attached.results.set(toolCallId, {
+      role: "toolResult", toolCallId, toolName, isError, details, timestamp: Date.now(),
+      content: typeof content === "string" ? [{type: "text", text: content}] : content,
+    } as ToolResultMessage);
+  }
+}
+
+/** The chat log's new model messages as one Pi input: their text and attachments, in order. */
+function toUserInput(messages: Message[]): Parameters<PiHarness["submit"]>[0] {
+  let users = messages.filter(m => m.role === "user");
+  if (users.every(m => typeof m.content === "string")) return users.map(m => m.content as string).join("\n\n");
+  let parts: (TextContent | ImageContent)[] = [];
+  for (let message of users) {
+    if (parts.length > 0) parts.push({type: "text", text: "\n\n"});
+    if (typeof message.content === "string") parts.push({type: "text", text: message.content});
+    else parts.push(...message.content as (TextContent | ImageContent)[]);
+  }
+  return parts as never;
+}
+
+/** Anthropic's limit on images in one request before the smaller per-image edge applies. */
+const MANY_IMAGES = 20;
+const MANY_IMAGES_MAX_EDGE = 2000;
+
+/**
+ * A request with more than MANY_IMAGES images may only carry images up to MANY_IMAGES_MAX_EDGE
+ * pixels on an edge, so larger ones are left out of that request (never out of the transcript).
+ * The text part beside each attachment already names its workspace file.
+ */
+export function limitRequestImages(messages: readonly Message[]): Message[] {
+  let count = 0;
+  for (let m of messages) if (Array.isArray(m.content)) for (let p of m.content) if (p.type === "image") ++count;
+  if (count <= MANY_IMAGES) return messages as Message[];
+  return messages.map(message => {
+    if (message.role !== "user" || !Array.isArray(message.content)) return message;
+    return {...message, content: message.content.map(part =>
+      part.type !== "image" || part.mimeType === PDF_MIME_TYPE ||
+          canInlineChatAttachmentImage(part.mimeType, Uint8Array.fromBase64(part.data), MANY_IMAGES_MAX_EDGE)
+        ? part
+        : {type: "text" as const, text: "[Image left out of this request, which has too many images for its " +
+            "size; binary contents are not inlined. Use byte-aware tools to inspect the workspace file.]"})};
+  });
+}
+
+function emptyAssistant(model: Model<Api>): AssistantMessage {
+  return {role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
+    usage: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0}},
+    stopReason: "stop", timestamp: Date.now()} as AssistantMessage;
 }

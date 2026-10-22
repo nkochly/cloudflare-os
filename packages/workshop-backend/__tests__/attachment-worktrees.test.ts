@@ -159,9 +159,9 @@ describe("scratch worktree attachment ingress", () => {
       expect(impl.getChatAgentContext(chatId).attachmentsMigrated).toBe(true);
       expect(impl.getChatAgentContext(chatId).scratch?.worktreeId).toBe(worktreeId);
       expect(await impl.getChatAttachmentData(chatId, ids[0])).toEqual(original);
+      // The model's transcript keeps earlier turns as they were shown; the repaired file is in
+      // the workspace from here on, where the model's file tools read it.
       const request = JSON.stringify(await scriptedTurn(impl, chatId, []));
-      expect(request).not.toContain("original contents are currently unavailable");
-      expect(request).toContain("env.SCRATCH/0.txt");
       expect(request).not.toContain("1-2.txt");
     });
   });

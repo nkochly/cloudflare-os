@@ -1966,14 +1966,18 @@ function messageText(content: Context["messages"][number]["content"]): string {
 
 /** The text of each message the model was shown as coming from the user, in order. */
 function userTexts(context: Context): string[] {
-  return context.messages.flatMap(
-      message => message.role === "user" ? [messageText(message.content)] : []);
+  return context.messages.flatMap(message => message.role === "user"
+      ? [messageText(message.content).replace(USER_CHANGES, "").trim()].filter(Boolean) : []);
 }
+
+// What the user changed between turns reaches the model inside the turn's input.
+const USER_CHANGES = /<user_changes>\n([\s\S]*?)\n<\/user_changes>/g;
 
 /** The text of each tool result the model was shown, which is how it sees a user's edits. */
 function toolResultTexts(context: Context): string[] {
-  return context.messages.flatMap(
-      message => message.role === "toolResult" ? [messageText(message.content)] : []);
+  return context.messages.flatMap(message => message.role === "toolResult"
+      ? [messageText(message.content)]
+      : message.role === "user" ? [...messageText(message.content).matchAll(USER_CHANGES)].map(m => m[1]) : []);
 }
 
 // The first release of a blueprint, its second, and the files of a gadget made from the first
@@ -2009,8 +2013,11 @@ async function noted(workspace: Workspace, blueprintId: string, modelId: string 
   let chatId = await propose(workspace, blueprintId, { modelId });
   expect(impl.storage.chatMeta.get(chatId).activeAgent).toBeUndefined();
   let context = await askLater(impl, chatId, "What happened?");
-  let [note, ...others] = userTexts(context);
-  expect([others, toolResultTexts(context)]).toEqual([["What happened?"], []]);
+  // The note and the owner's question reach the model together, as one input.
+  let [input, ...others] = userTexts(context);
+  expect([others, toolResultTexts(context)]).toEqual([[], []]);
+  expect(input.endsWith("\n\nWhat happened?")).toBe(true);
+  let note = input.slice(0, -"\n\nWhat happened?".length);
   return { chatId, kind: proposal(impl, chatId).merge.kind, note };
 }
 

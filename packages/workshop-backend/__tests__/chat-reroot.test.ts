@@ -504,6 +504,14 @@ describe("what the agent is told of a revert", () => {
 
 // What the agent is shown of the user's changes at the start of its next turn: the results of
 // the observeUserChanges calls that replay inserts, in order.
+// What the user changed reaches the model as part of its input, each framed as user changes.
+function observationsIn(message: any): string[] {
+  if (message.role !== "user") return [];
+  let text = typeof message.content === "string" ? message.content
+      : message.content.map((part: any) => part.type === "text" ? part.text : "").join("");
+  return [...text.matchAll(/<user_changes>\n([\s\S]*?)\n<\/user_changes>/g)].map(m => m[1]);
+}
+
 async function observations(impl: any): Promise<string[]> {
   putMessage(impl, { type: "message", message: "Go." });
   let faux = createFauxCore({ models: [{ id: "faux-model" }] });
@@ -515,10 +523,7 @@ async function observations(impl: any): Promise<string[]> {
   await runAgent(impl, { model: faux.getModel(), stream: faux.stream }, CHAT,
       { type: "agent", id: "faux-model", name: "Faux" }, new AbortController().signal, USER,
       { provider: "cloudflare", model: "faux-model", apiToken: "" } as any);
-  return contexts[0].messages.flatMap(message =>
-      message.role === "toolResult" && message.toolName === "observeUserChanges"
-          ? [message.content.map(part => part.type === "text" ? part.text : "").join("")]
-          : []);
+  return contexts[0].messages.flatMap(message => observationsIn(message));
 }
 
 // The update from mainline the chat last recorded, and its commits for the gadget.

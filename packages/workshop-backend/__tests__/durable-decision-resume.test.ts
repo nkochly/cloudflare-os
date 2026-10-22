@@ -414,15 +414,14 @@ describe("decision handoff using the existing execution row", () => {
     await evictDurableObject(s.stub);
     await s.visit(async impl => {
       await impl.waitForAllAgentsToComplete();
-      // An unresolved decision still protects its history from compaction, but must not make
-      // this new command recover as the old paused execution.
-      expect(impl.getActiveChatCompaction(CHAT)?.summary).toBe(
-          previous === "final response" ? "Done." : undefined);
+      // Pi compacts the chat's transcript; the command must not recover as the old paused
+      // execution.
       expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toBeUndefined();
       expect(impl.storage.activeAgents.get(CHAT)).toBeUndefined();
       expect([...impl.storage.chats.list()].filter(m => m.type === "error")).toEqual([]);
     });
-    expect(requests()).toBe(previous === "final response" ? 1 : 0); // Summary only, if compactable.
+    // Pi keeps a transcript this short whole, so the command makes no summary request.
+    expect(requests()).toBe(0);
   });
 
   it("waits for both kinds of decision and consumes the handoff only once", async () => {

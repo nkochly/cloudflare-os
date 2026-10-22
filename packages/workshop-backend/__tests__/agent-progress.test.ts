@@ -111,34 +111,24 @@ describe("agent progress diagnostics", () => {
     }
   });
 
-  it.each(["provider retry", "compaction reload"] as const)(
-      "preserves correlation and monotonic sequences across a %s", reason => inKernel(async impl => {
+  it("preserves correlation and monotonic sequences across a provider retry Pi makes", () => inKernel(async impl => {
     const logs = vi.spyOn(console, "debug").mockImplementation(() => {});
     const history = vi.spyOn(impl, "loadChatHistory");
-    const checkpoints = vi.spyOn(impl, "commitChatCompaction");
     const faux = createFauxCore({models: [{id: "faux-model"}]});
     faux.setResponses([
       fauxAssistantMessage(fauxToolCall("createGadget", {title: SECRET, bindingName: "FIRST"}), {stopReason: "toolUse"}),
-      ...(reason === "provider retry" ? [fauxAssistantMessage(fauxText(SECRET), {
-        stopReason: "error", errorMessage: `503 Service Unavailable ${SECRET}`,
-      })] : [fauxAssistantMessage(fauxText(SECRET))]),
+      fauxAssistantMessage(fauxText(SECRET), {stopReason: "error", errorMessage: `503 Service Unavailable ${SECRET}`}),
       fauxAssistantMessage(fauxToolCall("createGadget", {title: SECRET, bindingName: "SECOND"}), {stopReason: "toolUse"}),
-      ...(reason === "compaction reload" ? [fauxAssistantMessage(fauxText(SECRET))] : []),
       fauxAssistantMessage(fauxText(SECRET)),
     ]);
     await runAgent(impl, {model: faux.getModel(), stream: faux.stream}, 1, AUTHOR,
-      new AbortController().signal, USER, {
-        provider: "cloudflare", model: "faux-model", apiToken: SECRET,
-        // Force a checkpoint after each tool step; the extra faux responses supply its summary.
-        ...(reason === "compaction reload" ? {compactionInputBudget: 1} : {}),
-      });
-    expect(history).toHaveBeenCalledTimes(reason === "provider retry" ? 2 : 5);
-    expect(checkpoints).toHaveBeenCalledTimes(reason === "provider retry" ? 0 : 2);
+      new AbortController().signal, USER, {provider: "cloudflare", model: "faux-model", apiToken: SECRET});
+    expect(history).toHaveBeenCalledTimes(1);
     expect(faux.getPendingResponseCount()).toBe(0);
     const progress = logs.mock.calls.map(([entry]) => entry as Record<string, unknown>)
       .filter(entry => entry.component === "workshop.agent" && entry.executionId !== undefined);
     const events = (event: string) => progress.filter(entry => entry.event === event);
-    expect(faux.state.callCount).toBe(reason === "provider retry" ? 4 : 5);
+    expect(faux.state.callCount).toBe(4);
     expect(progress.some(entry => String(entry.event).startsWith("agent.model."))).toBe(false);
     expect(events("agent.step.persist.started").map(entry => entry.sequence)).toEqual([1, 2, 3]);
     expect(events("agent.step.persist.completed").map(entry => entry.sequence)).toEqual([1, 2, 3]);

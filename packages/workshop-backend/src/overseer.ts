@@ -1322,17 +1322,8 @@ class OverseerImpl implements AgentHooks {
   // Get a gadget's registry record, throwing an explicit error if it doesn't exist. A reference
   // to a deleted default gadget gets a distinct message, since old records resolving through
   // `defaultGadgetId` land here rather than silently retargeting some other gadget.
-  /**
-   * Pi runs a chat's turns (pi-chat.ts) when AGENT_ENGINE is "pi", and in every chat of a
-   * workspace an owner job built, so chats its gadgets spawn run on Pi too.
-   */
-  piChats?: PiChats;
-  usesPi(_chatId: number): boolean {
-    if (!this.piChats) return false;
-    if ((this.env as {AGENT_ENGINE?: string}).AGENT_ENGINE === "pi") return true;
-    return [...this.storage.externalChats.list()].some(
-        record => record.externalChatKey.startsWith(`${JOB_SOURCE}:`));
-  }
+  /** The Pi engine every chat turn runs on (pi-chat.ts). */
+  piChats!: PiChats;
 
   getGadgetRecord(id: WorkpieceId): GadgetRecord {
     let record = this.storage.gadgets.get(id);
@@ -7277,12 +7268,8 @@ class OverseerImpl implements AgentHooks {
         controller.signal.throwIfAborted();
 
         await this.#migrateChatAttachments(chatId);
-        if (this.usesPi(chatId)) {
-          await this.piChats!.runTurn(this, chosenModel, chatId, aiModel.profile, controller.signal);
-        } else {
-          await runAgent(
-              this, chosenModel, chatId, aiModel.profile, controller.signal, initiator, aiModel.config);
-        }
+        await runAgent(
+            this, chosenModel, chatId, aiModel.profile, controller.signal, initiator, aiModel.config);
         finished = true;
         turnLogger.debug("agent run finished", {
           event: "agent.run.finished", outcome: "ok",
@@ -10206,7 +10193,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
-    this.piChats = new PiChats(ctx, env.LOADER);
+    this.piChats = new PiChats(ctx);
     this.lifecycle = Lifecycle.install(this).use(this.piChats.harness);
     // Native RPC bypasses the Lifecycle's automatic startup, and the impl reads the job queue as it
     // recovers, so start it here; the impl's own blockConcurrencyWhile runs after this one.
