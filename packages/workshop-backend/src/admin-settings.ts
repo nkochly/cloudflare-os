@@ -866,7 +866,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
         cache: true,
         // The request is the same every time, which a gateway that caches responses would
         // answer without asking the provider.
-        headers: { "cf-aig-skip-cache": "true" },
+        skipCache: true,
       });
     } catch (error) {
       // The signal is this call's own, so nothing but the timeout aborts it.

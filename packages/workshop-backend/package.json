@@ -24,7 +24,7 @@
     "@gadgets/typed-storage": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
     "@platformatic/vfs": "0.5.0",
-    "agents": "0.28.1",
+    "agents": "0.29.0",
     "capnweb": "catalog:",
     "capnweb-validate": "catalog:",
     "diff": "catalog:",

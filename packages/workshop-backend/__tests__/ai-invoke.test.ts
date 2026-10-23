@@ -59,26 +59,41 @@ describe("completeText", () => {
           event({ delta: {}, finish_reason: "stop" }) + "data: [DONE]\n\n",
           { headers: { "content-type": "text/event-stream" } });
     });
+    // Workers AI models run on the binding's run(), recorded as a request with the gateway
+    // options it was given as the gateway headers they stand for.
+    const run = vi.fn(async (model: string, input: object, options: {
+      gateway?: { metadata?: object, skipCache?: boolean }, extraHeaders?: Record<string, string>,
+    }) => fetch(`https://workers-binding.ai/run/${model}`, {
+      method: "POST",
+      headers: {
+        ...options.extraHeaders,
+        ...(options.gateway?.metadata && { "cf-aig-metadata": JSON.stringify(options.gateway.metadata) }),
+        ...(options.gateway?.skipCache !== undefined && { "cf-aig-skip-cache": String(options.gateway.skipCache) }),
+      },
+      body: JSON.stringify({ model, ...input }),
+    }));
     const handle = getModel({
       CF_AI_GATEWAY: "platform-gateway",
       CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
       CF_AI_GATEWAY_PROVIDERS: "cloudflare,anthropic",
-      WORKERS_AI: { fetch },
+      WORKERS_AI: { fetch, run },
     } as unknown as Cloudflare.Env,
         { provider: "cloudflare", model: MODEL, apiToken: "", ...config },
         { type: "user", id: "user-123", name: "User" });
     return { handle, sent, bodies };
   }
 
-  it("sends a request's own headers beside the handle's", async () => {
+  // The binding is authenticated in-account, so no gateway credential rides the request.
+  it("sends a request's own headers and cache option beside the handle's attribution", async () => {
     const { handle, sent } = answering();
     expect(await completeText(handle, {
-      prompt: "hello", headers: { "cf-aig-skip-cache": "true" },
+      prompt: "hello", headers: { "x-request": "own" }, skipCache: true,
     })).toBe("OK");
     expect(sent).toHaveLength(1);
+    expect(sent[0]!.get("x-request")).toBe("own");
     expect(sent[0]!.get("cf-aig-skip-cache")).toBe("true");
     expect(JSON.parse(sent[0]!.get("cf-aig-metadata")!)).toStrictEqual({ user: "user-123" });
-    expect(sent[0]!.get("cf-aig-authorization")).toMatch(/^Bearer /);
+    expect(sent[0]!.has("cf-aig-authorization")).toBe(false);
   });
 
   it("sends only the handle's headers when given none", async () => {
@@ -87,7 +102,6 @@ describe("completeText", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]!.has("cf-aig-skip-cache")).toBe(false);
     expect(JSON.parse(sent[0]!.get("cf-aig-metadata")!)).toStrictEqual({ user: "user-123" });
-    expect(sent[0]!.get("cf-aig-authorization")).toMatch(/^Bearer /);
   });
 
   // A handle with a reasoning level names that level on the requests that ask for thinking. On

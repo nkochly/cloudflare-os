@@ -2,8 +2,8 @@ import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type {
   AnthropicMessagesCompat, Api, AssistantMessageEventStream, ClassifierApi, ClassifierContext,
-  ClassifierModel, ClassifierOptions, ClassifierResult, Context, FetchFunction, Model, ModelCost,
-  OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction,
+  ClassifierModel, ClassifierOptions, ClassifierResult, Context, Model, ModelCost,
+  OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction, StreamOptions,
 } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, getSupportedThinkingLevels, normalizeContext }
   from "@earendil-works/pi-ai";
@@ -22,6 +22,7 @@ import {
 } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
+import { type AI, createAI, type PiModelOptions } from "agents/models/pi-ai";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
@@ -85,6 +86,8 @@ export type ModelStreamOptions = SimpleStreamOptions & {
    * quick, and none of them benefit from cross-step reasoning. Default: true.
    */
   thinking?: boolean;
+  /** When true, a gateway that caches responses sends the request to the provider anyway. */
+  skipCache?: boolean;
 };
 
 /**
@@ -455,10 +458,14 @@ type HandleArgs = {
   gatewayMetadata?: GatewayMetadata;
   sessionAffinity?: string;
   aiGatewayLogRoute?: AiGatewayLogRoute;
-  // Transport override for every request on this handle: how a binding-routed model reaches the
-  // gateway over env.WORKERS_AI.fetch() instead of the global fetch (see bindingFetch).
-  // A per-call options.fetch still wins, which tests rely on to capture requests.
-  fetch?: FetchFunction;
+  // The Agents SDK provider that carries this handle's requests to AI Gateway (see gatewayAI).
+  // Without one, pi's own API impl sends them, with `fetch` and the auth above.
+  ai?: AI;
+  // A Workers AI model the SDK runs on its own run path (`env.AI.run` through the gateway), by
+  // id and the descriptor's limits; the descriptor above still describes it to the rest of pi.
+  workersAI?: { id: string; options: PiModelOptions };
+  // The model as the SDK is handed it, where it differs from `model` (see getModelViaGateway).
+  wire?: Model<Api>;
   // The reasoning level of main turns, and the ID of the pi entry the model's flags come from
   // (see reasoningOptions). No level gives the model its built-in request (see builtInReasoning).
   reasoning?: ReasoningLevel;
@@ -482,18 +489,21 @@ function makeHandle(args: HandleArgs): ModelHandle {
   const handle: ModelHandle = {
     model: args.model,
     aiGatewayLogRoute: args.aiGatewayLogRoute,
-    stream: (model, context, { thinking = true, ...options } = {}) => {
+    stream: (model, context, { thinking = true, skipCache, ...options } = {}) => {
       // Never let a failed request read a previous request's response metadata.
       handle.lastResponse = undefined;
       // This request's own response metadata: concurrent requests on one handle overwrite
       // `lastResponse`, but not this.
       let received: ModelHandle["lastResponse"];
+      // The SDK sends gateway attribution and cache options itself; pi's own API impls take
+      // them as the gateway's headers.
       const headers: ProviderHeaders = {
         ...args.headers,
         ...options.headers,
-        ...(args.gatewayMetadata
+        ...(!args.ai && args.gatewayMetadata
             ? { "cf-aig-metadata": JSON.stringify(args.gatewayMetadata) }
             : {}),
+        ...(!args.ai && skipCache ? { "cf-aig-skip-cache": "true" } : {}),
       };
       const transcript = normalizeContext(context);
       const merged: SimpleStreamOptions = {
@@ -511,7 +521,6 @@ function makeHandle(args: HandleArgs): ModelHandle {
                 ? (anthropicCompat?.supportsMidConvoEffort === true
                     ? { effort: "low" } : { thinkingEnabled: false })
                 : {}),
-        ...(args.fetch !== undefined ? { fetch: args.fetch } : {}),
         ...options,
         ...(args.apiKey !== undefined ? { apiKey: args.apiKey } : {}),
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
@@ -542,10 +551,36 @@ function makeHandle(args: HandleArgs): ModelHandle {
         },
       };
       return traceChat(model, () => received,
-          () => streamFn(model, transcript, merged));
+          () => args.ai
+              ? sdkStream(args.ai, model === args.model ? args.wire ?? model : model,
+                  args.workersAI, transcript, {
+                    ...merged,
+                    ...(args.gatewayMetadata ? { metadata: args.gatewayMetadata } : {}),
+                  }, skipCache ? { skipCache: true } : {})
+              : streamFn(model, transcript, merged));
     },
   };
   return handle;
+}
+
+// Sends one request through the Agents SDK. A Workers AI model goes by id, with the request's
+// reasoning effort as the SDK's own setting, which it forwards to Workers AI as it is: the
+// model's wire name for the level from its level map. As pi does, a request with no effort is
+// sent the map's "off" when the descriptor has a map (it has one only once a level is set), and
+// otherwise no effort, which leaves the model its default.
+function sdkStream(ai: AI, model: Model<Api>, workersAI: HandleArgs["workersAI"], context: Context,
+                   options: SimpleStreamOptions, gateway: PiModelOptions): AssistantMessageEventStream {
+  if (!workersAI) return ai.stream(ai(model, gateway), context, options as StreamOptions);
+  const { reasoningEffort: level, ...rest } = options as SimpleStreamOptions &
+      { reasoningEffort?: string };
+  const map = model.thinkingLevelMap;
+  const wire = level === undefined
+      ? (typeof map?.off === "string" ? map.off : undefined)
+      : map?.[level as ReasoningLevel] ?? level;
+  const effort = wire === undefined ? {} : { reasoningEffort: wire };
+  return ai.stream(
+      ai(workersAI.id as never, { ...workersAI.options, ...gateway, ...effort } as PiModelOptions),
+      context, rest as StreamOptions);
 }
 
 // GPT-5.6 and later keep a separate cache for each prompt_cache_key, so the key pi sets from the
@@ -637,6 +672,24 @@ function getModelViaUserGateway(
   if (!model) {
     throw new Error(`Provider "${config.provider}" is not supported via unified billing.`);
   }
+  const ai = gatewayAI(model, false, () => createAI({
+    accountId: userGateway.accountId, apiToken: userGateway.apiKey, id: "default",
+  }));
+  if (ai) {
+    return makeHandle({
+      model,
+      ai,
+      gatewayMetadata: metadata,
+      sessionAffinity,
+      reasoning: config.reasoning,
+      formatId: gatewayCatalogModel(config)?.id,
+      aiGatewayLogRoute: {
+        gateway: "default",
+        accountId: userGateway.accountId,
+        apiToken: userGateway.apiKey,
+      },
+    });
+  }
   return makeHandle({
     model,
     // The Google SDK requires an API key and sends it as `x-goog-api-key`, which the gateway
@@ -668,20 +721,6 @@ function getModelViaUserGateway(
  */
 const CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL = "cloudflare-gateway-binding";
 
-/**
- * `Ai#fetch` exists at runtime but @cloudflare/workers-types' `Ai` doesn't declare it, so the
- * binding is cast structurally to reach the passthrough.
- */
-type AiFetchBinding = {
-  fetch(input: Request | string | URL, init?: RequestInit): Promise<Response>;
-};
-
-// pi drives the model's baseUrl, which already names the gateway route on the binding's host,
-// so the binding's fetch passes through unchanged -- no URL rewriting needed.
-function bindingFetch(binding: Ai): FetchFunction {
-  return (input, init) => (binding as unknown as AiFetchBinding).fetch(input, init);
-}
-
 // Platform free-tier path: route through the deployment's configured AI Gateway (platform-funded).
 // Used only for requests that are NOT billed to a connected user's account.
 function getModelViaGateway(
@@ -702,8 +741,7 @@ function getModelViaGateway(
     // pi's API impls explicitly recognize cf-aig-authorization and skip SDK auth; the null
     // values suppress the SDKs' own auth headers so the gateway's server-managed provider keys
     // apply.
-    "cf-aig-authorization":
-        `Bearer ${binding ? CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL : gwConfig.apiToken}`,
+    "cf-aig-authorization": `Bearer ${gwConfig.apiToken}`,
     Authorization: null,
     "x-api-key": null,
   };
@@ -719,7 +757,9 @@ function getModelViaGateway(
   // Every provider -- Workers AI included -- rides the same gateway, with the same log route
   // and attribution metadata. Binding-routed providers address it on the binding's host, which
   // takes no account id (the binding channel carries identity); the paths are otherwise the
-  // same, so the model descriptors are built identically from either root.
+  // same, so the model descriptors are built identically from either root. The Agents SDK sends
+  // every model it can (see gatewayAI); what is left, Gemini and Workers AI without the binding,
+  // goes over HTTPS with the gateway token.
   const gateway = gwConfig.gateway;
   const gatewayUrl = binding
       ? `https://workers-binding.ai/ai-gateway/gateways/${gateway}`
@@ -727,6 +767,24 @@ function getModelViaGateway(
   const model = gatewayNativeModel(config, gatewayUrl);
   if (!model) {
     throw new Error(`Provider "${config.provider}" is not supported through AI Gateway.`);
+  }
+  const ai = gatewayAI(model, binding !== undefined, () => binding
+      ? createAI({ binding, id: gateway })
+      : createAI({ accountId: gwConfig.accountId, apiToken: gwConfig.apiToken!, id: gateway }));
+  if (ai) {
+    return makeHandle({
+      model,
+      ai,
+      // The SDK tells the provider from a gateway-shaped baseUrl; the binding or token it was
+      // made with already names the account and gateway.
+      wire: { ...model, baseUrl: gatewayNativeModel(config, `${gatewayBase}/${gateway}`)!.baseUrl },
+      ...(config.provider === "cloudflare" ? { workersAI: workersAIRun(model) } : {}),
+      gatewayMetadata: metadata,
+      sessionAffinity: options.sessionAffinity,
+      reasoning: config.reasoning,
+      formatId: gatewayCatalogModel(config)?.id,
+      aiGatewayLogRoute: logRoute(gateway),
+    });
   }
 
   return makeHandle({
@@ -739,13 +797,40 @@ function getModelViaGateway(
     // the gateway recognizes its own token there and applies the stored Google key instead.
     ...(config.provider === "google" ? { apiKey: gwConfig.apiToken } : {}),
     headers: gatewayAuthHeaders,
-    ...(binding ? { fetch: bindingFetch(binding) } : {}),
     gatewayMetadata: metadata,
     sessionAffinity: options.sessionAffinity,
     reasoning: config.reasoning,
     formatId: gatewayCatalogModel(config)?.id,
     aiGatewayLogRoute: logRoute(gateway),
   });
+}
+
+// The APIs the Agents SDK's pi provider sends to AI Gateway itself. Gemini's
+// (google-generative-ai) is not one of them, so a Google model keeps pi's own API impl, with the
+// gateway auth and transport built here (see gatewayAI for Workers AI).
+const SDK_GATEWAY_APIS: ReadonlySet<Api> = new Set<Api>([
+  "anthropic-messages", "openai-responses", "openai-completions",
+]);
+
+// The Agents SDK provider for a gateway-routed model, or undefined when the SDK cannot send its
+// API. The SDK owns the transport and the gateway auth; the model descriptor's gateway-shaped
+// baseUrl names only the provider slug, since the binding or token already chose the gateway.
+//
+// A Workers AI model goes on the SDK's run path, which only the binding reaches through the
+// gateway: over HTTPS the SDK sends it to the account's REST API instead, which a connected
+// user's gateway token cannot call. So without the binding it keeps pi's own API impl.
+function gatewayAI(model: Model<Api>, binding: boolean, make: () => AI): AI | undefined {
+  if (!SDK_GATEWAY_APIS.has(model.api)) return undefined;
+  if (model.provider === "cloudflare-workers-ai" && !binding) return undefined;
+  return make();
+}
+
+// A Workers AI model for the SDK's run path, by id, with the descriptor's name, limits and cost.
+function workersAIRun(model: Model<Api>): NonNullable<HandleArgs["workersAI"]> {
+  return { id: model.id, options: {
+    name: model.name, contextWindow: model.contextWindow, maxTokens: model.maxTokens,
+    reasoning: model.reasoning, input: model.input, cost: model.cost,
+  } };
 }
 
 // Auth for a direct connection whose client can omit the API key, which `keyHeader` carries. A

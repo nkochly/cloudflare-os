@@ -998,7 +998,21 @@ function tested(respond: (request: Request) => Response | Promise<Response>,
     });
     return respond(request);
   });
-  const settings = adminSettings({ ...GATEWAY, WORKERS_AI: { fetch }, ...vars });
+  // Workers AI models run on the binding's run(): recorded as a request to the run route, with
+  // the gateway options it was given as the gateway headers they stand for.
+  const runModel = vi.fn(async (model: string, input: object, options: {
+    gateway?: { id?: string, metadata?: object, skipCache?: boolean },
+    extraHeaders?: Record<string, string>, signal?: AbortSignal,
+  }) => fetch(`https://workers-binding.ai/ai-gateway/gateways/${options.gateway?.id}/run/${model}`, {
+    method: "POST", signal: options.signal,
+    headers: {
+      ...options.extraHeaders,
+      ...(options.gateway?.metadata && { "cf-aig-metadata": JSON.stringify(options.gateway.metadata) }),
+      ...(options.gateway?.skipCache !== undefined && { "cf-aig-skip-cache": String(options.gateway.skipCache) }),
+    },
+    body: JSON.stringify({ model, ...input }),
+  }));
+  const settings = adminSettings({ ...GATEWAY, WORKERS_AI: { fetch, run: runModel }, ...vars });
   const logging = async <T>(event: string, run: (admin: AdminSettings) => Promise<T>) => {
     const logged = vi.spyOn(console, "info").mockImplementation(() => {});
     try {
@@ -1033,8 +1047,7 @@ describe("AdminSettings.testGatewayProvider", () => {
     expect(result).toStrictEqual({ model: KIMI, ok: true });
     expect(requests).toHaveLength(1);
     const [{ url, headers, body }] = requests;
-    expect(url).toBe("https://workers-binding.ai/ai-gateway/gateways/platform-gateway/" +
-        "workers-ai/v1/chat/completions");
+    expect(url).toBe(`https://workers-binding.ai/ai-gateway/gateways/platform-gateway/run/${KIMI}`);
     expect(JSON.parse(headers.get("cf-aig-metadata")!))
         .toStrictEqual({ user: "admin@example.com" });
     // Every test sends the same request, which a caching gateway must not answer itself.
@@ -1057,7 +1070,7 @@ describe("AdminSettings.testGatewayProvider", () => {
     const { test, requests } = tested(refusal(401, "Incorrect API key provided."));
     const { result, entries } = await test("cloudflare");
     expect(result).toStrictEqual(
-        { model: KIMI, ok: false, status: 401, message: "401 Incorrect API key provided." });
+        { model: KIMI, ok: false, status: 401, message: "Incorrect API key provided." });
 
     expect(entries).toEqual([{
       component: "workshop.admin.settings", event: "gateway.provider.test",
@@ -1078,11 +1091,10 @@ describe("AdminSettings.testGatewayProvider", () => {
         { status: 401 }));
     const { result, entries } = await test("openai");
     expect(requests.map(({ url }) => url)).toEqual(
-        ["https://workers-binding.ai/ai-gateway/gateways/platform-gateway/openai/responses"]);
+        ["https://workers-binding.ai/ai-gateway/gateways/platform-gateway/openai/v1/responses"]);
     expect(result).toStrictEqual({
       model, ok: false, status: 401,
-      message: 'OpenAI API error (401): ' +
-          '{"message":"Incorrect API key provided.","code":"invalid_api_key"}',
+      message: "Incorrect API key provided.",
     });
     expect(entries).toEqual([{
       component: "workshop.admin.settings", event: "gateway.provider.test",
@@ -1181,15 +1193,15 @@ describe("AdminSettings.testGatewayProvider", () => {
     const { result, entries } = await test("cloudflare");
     expect(result).toStrictEqual({
       model: KIMI, ok: false, status: 403,
-      message: `403 bad key: [redacted] was refused ${"x".repeat(400)}`.slice(0, 300),
+      message: `bad key: [redacted] was refused ${"x".repeat(400)}`.slice(0, 300),
     });
     expect(JSON.stringify(entries)).not.toContain("gateway-token");
     expect(JSON.stringify(entries)).not.toContain("refused");
 
     // A token the cut would otherwise leave the start of.
-    const straddling = tested(refusal(403, `${"y".repeat(292)}gateway-token`));
+    const straddling = tested(refusal(403, `${"y".repeat(296)}gateway-token`));
     const { message } = (await straddling.test("cloudflare")).result as { message: string };
-    expect(message).toBe(`403 ${"y".repeat(292)}[red`);
+    expect(message).toBe(`${"y".repeat(296)}[red`);
   });
 
   // The request is out for as long as fifteen seconds, which no other admin call waits for.
@@ -1265,8 +1277,7 @@ describe("AdminSettings.testGatewayModel", () => {
     expect(result).toStrictEqual({ model: GLM, ok: true });
     expect(requests).toHaveLength(1);
     const [{ url, headers, body }] = requests;
-    expect(url).toBe("https://workers-binding.ai/ai-gateway/gateways/platform-gateway/" +
-        "workers-ai/v1/chat/completions");
+    expect(url).toBe(`https://workers-binding.ai/ai-gateway/gateways/platform-gateway/run/${GLM}`);
     expect(JSON.parse(headers.get("cf-aig-metadata")!))
         .toStrictEqual({ user: "admin@example.com" });
     // Every test of a model sends the same request, which a caching gateway must not answer
@@ -1371,7 +1382,7 @@ describe("AdminSettings.testGatewayModel", () => {
     const { result, entries } = await testModel(GLM);
     // On one line, without the deployment's gateway token.
     expect(result).toStrictEqual({
-      model: GLM, ok: false, status: 401, message: "401 Incorrect API key for [redacted].",
+      model: GLM, ok: false, status: 401, message: "Incorrect API key for [redacted].",
     });
 
     expect(entries).toEqual([{ ...LOGGED, modelId: GLM, outcome: "error", statusCode: 401 }]);
@@ -1489,8 +1500,8 @@ describe("AdminSettings.testNewGatewayModel", () => {
     expect(sent(requests)).toEqual(
         [{ cap: 2048 }, { effort: "none", cap: 2048 }, { effort: "high", cap: 2048 }]);
     for (let { url, headers, body } of requests) {
-      expect(url).toBe("https://workers-binding.ai/ai-gateway/gateways/platform-gateway/" +
-          "workers-ai/v1/chat/completions");
+      expect(url).toBe("https://workers-binding.ai/ai-gateway/gateways/platform-gateway/run/" +
+          STATED.id);
       expect(JSON.parse(headers.get("cf-aig-metadata")!))
           .toStrictEqual({ user: "admin@example.com" });
       expect(headers.get("cf-aig-skip-cache")).toBe("true");
@@ -1545,7 +1556,7 @@ describe("AdminSettings.testNewGatewayModel", () => {
       ...passed(STATED, [null, "off"]),
       {
         model: STATED.id, ok: false, status: 400, reasoning: "high",
-        message: "400 This model takes no effort above none.",
+        message: "This model takes no effort above none.",
       },
     ]);
     expect(requests).toHaveLength(3);

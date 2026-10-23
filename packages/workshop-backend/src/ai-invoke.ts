@@ -72,6 +72,8 @@ export async function completeText(handle: ModelHandle, args: {
    * cache write.
    */
   cache?: boolean;
+  /** When true, a gateway that caches responses asks the provider anyway (see ModelStreamOptions). */
+  skipCache?: boolean;
 }): Promise<string> {
   const messages: Message[] = args.messages ??
       [{ role: "user", content: args.prompt ?? "", timestamp: Date.now() }];
@@ -83,6 +85,7 @@ export async function completeText(handle: ModelHandle, args: {
     signal: args.signal,
     headers: args.headers,
     thinking: args.thinking ?? false,
+    ...(args.skipCache ? { skipCache: true } : {}),
     ...(args.cache ? {} : { cacheRetention: "none" }),
   });
   const message = await stream.result();

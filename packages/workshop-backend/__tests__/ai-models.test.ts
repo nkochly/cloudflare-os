@@ -74,14 +74,44 @@ const fetchStub = (async (input: RequestInfo | URL, init?: RequestInit) => {
   return Response.json({ error: { type: "bad_request", message: "stubbed" } }, { status: 400 });
 }) as typeof fetch;
 
+// A Workers AI binding whose requests land in capturedRequests: provider-native requests by
+// fetch, as the stub takes them, and Workers AI models by run, recorded as a request to
+// `run:<model>` whose body is the model and its input and whose headers are the run's
+// gateway options and extra headers.
+function recordingBinding(): Ai {
+  return {
+    fetch: (input: Request | string | URL, init?: RequestInit) =>
+        fetchStub(input as RequestInfo, init),
+    run: async (model: string, input: object,
+                options: { gateway?: object; extraHeaders?: Record<string, string> }) => {
+      capturedRequests.push({
+        url: `run:${model}`,
+        headers: new Headers({
+          ...options.extraHeaders, "x-test-gateway": JSON.stringify(options.gateway ?? null),
+        }),
+        body: JSON.stringify({ model, ...input }),
+      });
+      return Response.json({ error: { type: "bad_request", message: "stubbed" } }, { status: 400 });
+    },
+  } as unknown as Ai;
+}
+
 // Runs one request through the handle with the fetch stub and returns what was sent.
 async function captureRequest(
     handle: ModelHandle,
     options: NonNullable<Parameters<ModelHandle["stream"]>[2]> = {}): Promise<CapturedRequest> {
-  const stream = await handle.stream(handle.model, {
-    messages: [{ role: "user", content: "hello", timestamp: 0 }],
-  }, { fetch: fetchStub, maxRetries: 0, ...options });
-  const message = await stream.result();
+  // The Agents SDK sends gateway requests over the global fetch, which a per-call fetch does
+  // not replace, so the stub stands in for both.
+  vi.stubGlobal("fetch", options.fetch ?? fetchStub);
+  let message;
+  try {
+    const stream = await handle.stream(handle.model, {
+      messages: [{ role: "user", content: "hello", timestamp: 0 }],
+    }, { fetch: fetchStub, maxRetries: 0, ...options });
+    message = await stream.result();
+  } finally {
+    vi.unstubAllGlobals();
+  }
   expect(message.stopReason).toBe("error");
   expect(capturedRequests.length).toBeGreaterThan(0);
   return capturedRequests[0];
@@ -334,10 +364,9 @@ describe("getModel AI Gateway binding transport", () => {
     expect(urlWithoutQuery(entry.url)).toBe(
         "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/anthropic/v1/messages");
     expect(entry.method).toBe("POST");
-    // The sentinel auth header satisfies pi's request-auth check; the gateway recognizes and
-    // strips it on binding-routed requests, so the shim forwards it. The SDK's own auth
-    // headers stay suppressed.
-    expect(entry.headers["cf-aig-authorization"]).toBe("Bearer cloudflare-gateway-binding");
+    // The Agents SDK sends it over the binding, which is authenticated in-account: no gateway
+    // or provider credential rides the request.
+    expect(entry.headers["cf-aig-authorization"]).toBeUndefined();
     const headerNames = Object.keys(entry.headers).map((name) => name.toLowerCase());
     expect(headerNames).not.toContain("x-api-key");
     expect(headerNames).not.toContain("authorization");
@@ -350,38 +379,20 @@ describe("getModel AI Gateway binding transport", () => {
     expect((JSON.parse(entry.body) as { model: string }).model).toBe("claude-sonnet-4-5");
   }, 15000);
 
-  it("drives Workers AI through the binding via its gateway route", async () => {
-    const handle = getModel(bindingEnv(), WORKERS_AI_CONFIG, INITIATOR);
+  it("runs Workers AI on the Agents SDK's run path through the binding's gateway", async () => {
+    const handle = getModel(bindingEnv({ WORKERS_AI: recordingBinding() }), WORKERS_AI_CONFIG,
+        INITIATOR, { sessionAffinity: "session-a" });
 
     expect(handle.model.baseUrl).toBe(
         "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/workers-ai/v1");
     expect(handle.aiGatewayLogRoute).toEqual({ gateway: "platform-gateway" });
 
-    const entry = await captureEntry(handle);
-    expect(entry.url).toBe(
-        "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/workers-ai/" +
-        "v1/chat/completions");
-    expect((JSON.parse(entry.body) as { model: string }).model)
-        .toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
-    // openai-completions adapters inject `Authorization: Bearer unused` under header-owned
-    // auth; the gatewayAuthHeaders nulls must delete it before dispatch, else the gateway
-    // would treat it as a request-supplied provider key overriding stored keys.
-    const headerNames = Object.keys(entry.headers).map((name) => name.toLowerCase());
-    expect(headerNames).not.toContain("authorization");
-    expect(headerNames).not.toContain("x-api-key");
-  }, 15000);
-
-  it("lets a per-call fetch override the binding transport", async () => {
-    // Tests and diagnostics inject options.fetch; it must win over the handle's binding fetch.
-    // The URL is the model's, so it still names the binding route -- only the transport swaps.
-    const handle = getModel(bindingEnv(), ANTHROPIC_CONFIG, INITIATOR);
-
     const request = await captureRequest(handle);
-    expect(capturedEntries).toHaveLength(0);
-    expect(urlWithoutQuery(request.url)).toBe(
-        "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/anthropic/v1/messages");
-    expect(request.headers.get("cf-aig-authorization"))
-        .toBe("Bearer cloudflare-gateway-binding");
+    expect(request.url).toBe("run:@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+    expect(JSON.parse(request.headers.get("x-test-gateway")!)).toMatchObject(
+        { id: "platform-gateway" });
+    expect(request.headers.get("x-session-affinity")).toBe("session-a");
+    expect(request.headers.get("authorization")).toBeNull();
   }, 15000);
 
   it("keeps Google on HTTPS with the token while other providers use the binding", async () => {
@@ -407,8 +418,8 @@ describe("getModel AI Gateway binding transport", () => {
     const entry = await captureEntry(anthropicHandle);
     expect(urlWithoutQuery(entry.url)).toBe(
         "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/anthropic/v1/messages");
-    // The binding arm carries the sentinel, never the real gateway token.
-    expect(entry.headers["cf-aig-authorization"]).toBe("Bearer cloudflare-gateway-binding");
+    // The binding arm never carries the real gateway token.
+    expect(entry.headers["cf-aig-authorization"]).toBeUndefined();
   }, 15000);
 
   it("requires the token when google is an enabled provider", () => {
@@ -755,26 +766,20 @@ describe("gateway model reasoning levels", () => {
   });
   const claudeBody = (config: GatewayConfig, max_tokens: number, extra: object = {}) =>
       ({ model: config.model, messages: [CLAUDE_HELLO], max_tokens, stream: true, ...extra });
+  // The Agents SDK builds OpenAI's Responses request itself, in this key order.
   const gptBody = (config: GatewayConfig, extra: object) => ({
-    model: config.model,
     input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
-    stream: true, store: false, ...extra,
+    model: config.model, store: false, stream: true, ...extra,
   });
-  // An OpenAI request that asks for an effort, which also asks for the reasoning back. For a model
-  // that takes a mid-conversation effort, pi fixes the request's effort at medium and carries the
-  // level in a configuration update after the prompt.
-  const gptEffortBody = (config: GatewayConfig, effort: string, midConversation = true) =>
-    midConversation ? {
-      ...gptBody(config, {
-        reasoning: { effort: "medium", summary: "auto" }, include: ["reasoning.encrypted_content"],
-      }),
-      input: [
-        { role: "user", content: [{ type: "input_text", text: "hello" }] },
-        { type: "configuration_update", reasoning: { effort } },
-      ],
-    } : gptBody(config, {
-      reasoning: { effort, summary: "auto" }, include: ["reasoning.encrypted_content"],
-    });
+  // An OpenAI request that asks for an effort, which also asks for the reasoning back. The SDK
+  // sends the effort on the request itself, mid-conversation or not.
+  const gptEffortBody = (config: GatewayConfig, effort: string) => gptBody(config, {
+    include: ["reasoning.encrypted_content"], reasoning: { effort, summary: "auto" },
+  });
+  // What an OpenAI model that reasons is sent with no effort: the model's own "off".
+  const gptOffBody = (config: GatewayConfig, effort = "none") => gptBody(config, {
+    include: ["reasoning.encrypted_content"], reasoning: { effort },
+  });
   const completionsBody = (config: GatewayConfig, extra: object = {}) => ({
     model: config.model, messages: [{ role: "user", content: "hello" }], stream: true,
     stream_options: { include_usage: true }, ...extra,
@@ -846,7 +851,7 @@ describe("gateway model reasoning levels", () => {
 
   it("turns reasoning off on an OpenAI model that can stop reasoning", async () => {
     expect(await parsed({ ...GPT_6_SOL, reasoning: "off" }))
-        .toEqual(gptBody(GPT_6_SOL, { reasoning: { effort: "none" } }));
+        .toEqual(gptOffBody(GPT_6_SOL));
   });
 
   // Each Workers AI model takes the levels pi's catalog gives it, and a level between two of
@@ -964,7 +969,7 @@ describe("gateway model reasoning levels", () => {
     const handle = getModel(env({ CF_AI_GATEWAY: undefined }),
         { ...GPT, apiToken: "direct-api-token", reasoning: "max" }, INITIATOR);
     expect(JSON.parse((await captureRequest(handle)).body))
-        .toEqual(gptEffortBody(GPT, "medium", false));
+        .toEqual(gptEffortBody(GPT, "medium"));
   });
 
   const LOW_TO_MAX = ["low", "medium", "high", "xhigh", "max"];
@@ -1066,12 +1071,12 @@ describe("gateway model reasoning levels", () => {
   });
 
   // Every route getModel() has through an AI Gateway: the platform's over HTTPS and over the
-  // Workers AI binding (whose requests the injected fetch takes), and a connected user's.
+  // Workers AI binding (whose requests the recording binding takes), and a connected user's.
   const GATEWAY_ROUTES = [
     ["gateway.ai.cloudflare.com", gatewayEnv, {}],
     ["workers-binding.ai", env({
       CF_AI_GATEWAY_API_TOKEN: undefined, CF_AI_GATEWAY_PROVIDERS: "anthropic,openai,cloudflare",
-      WORKERS_AI: {} as Ai,
+      WORKERS_AI: recordingBinding(),
     }), {}],
     ["gateway.ai.cloudflare.com", gatewayEnv,
       { userGateway: { accountId: "user-account-id", apiKey: "user-token" } }],
@@ -1289,7 +1294,7 @@ describe("gateway model reasoning levels", () => {
         async (stated, effort) => {
       const gpt = stating(GPT_NEXT, ...stated);
       expect(builtIn(gpt)).toBe(effort);
-      expect(await parsed(gpt)).toEqual(gptEffortBody(GPT_NEXT, effort, false));
+      expect(await parsed(gpt)).toEqual(gptEffortBody(GPT_NEXT, effort));
     });
 
     it("sends a Workers AI model a stated level as its effort, and none while no level is set",
@@ -1323,14 +1328,14 @@ describe("gateway model reasoning levels", () => {
     it("asks an OpenAI model for a stated level by its own name", async () => {
       const gpt = stating(GPT_NEXT, "off", "minimal", "xhigh", "max");
       for (const level of ["minimal", "xhigh", "max"] as const) {
-        expect(await parsed({ ...gpt, reasoning: level })).toEqual(gptEffortBody(GPT_NEXT, level, false));
+        expect(await parsed({ ...gpt, reasoning: level })).toEqual(gptEffortBody(GPT_NEXT, level));
       }
-      expect(await parsed({ ...gpt, reasoning: "low" })).toEqual(gptEffortBody(GPT_NEXT, "xhigh", false));
+      expect(await parsed({ ...gpt, reasoning: "low" })).toEqual(gptEffortBody(GPT_NEXT, "xhigh"));
       expect(await parsed({ ...gpt, reasoning: "off" }))
-          .toEqual(gptBody(GPT_NEXT, { reasoning: { effort: "none" } }));
+          .toEqual(gptOffBody(GPT_NEXT));
       // One that is not stated to stop reasoning is asked for its lowest level.
       expect(await parsed({ ...stating(GPT_NEXT, "high", "max"), reasoning: "off" }))
-          .toEqual(gptEffortBody(GPT_NEXT, "high", false));
+          .toEqual(gptEffortBody(GPT_NEXT, "high"));
     });
 
     it("gives an Anthropic model a stated level as a budget, or as the effort of the model " +
@@ -1568,7 +1573,13 @@ describe("PDF attachment bridging", () => {
         timestamp: 0,
       }],
     }, { fetch: fetchStub, maxRetries: 0 });
-    const message = await stream.result();
+    vi.stubGlobal("fetch", fetchStub);
+    let message;
+    try {
+      message = await stream.result();
+    } finally {
+      vi.unstubAllGlobals();
+    }
     expect(message.stopReason).toBe("error");
     return JSON.parse(capturedRequests[0].body);
   }
