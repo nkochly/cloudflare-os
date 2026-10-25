@@ -125,8 +125,10 @@ export class PiChats {
     let registry = createRegistry();
     registry.install(extension);
     this.harness = new LazyPiHarness(() => this.#hasChats(), {
-      harness: ({storage, context}) => Harness.open(storage, {
+      harness: ({storage, context, onWake}) => Harness.open(storage, {
         models: this.#models, registry, settings: {toolExecution: "sequential"},
+        // Pi keeps no timer while a task sleeps (a retry's backoff): PiHarness sets the alarm, so the object can hibernate.
+        onWake,
         onReport: error => console.error(JSON.stringify({event: "pi.report", error: String(error)})),
       }, context),
     });

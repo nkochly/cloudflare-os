@@ -1768,9 +1768,13 @@ describe("System prompt cache blocks", () => {
     return handle;
   }
 
+  // Pi puts message-anchored items (additional_tools) ahead of the system message.
+  const systemItem = (body: string) =>
+      (JSON.parse(body).input as { content?: unknown }[]).find(item => item.content !== undefined);
+
   it("puts an OpenAI GPT-5.6+ breakpoint after the static text", async () => {
     const handle = openAiHandle("gpt-6-luna");
-    expect(JSON.parse(await captureBody(handle, true)).input[0]).toEqual({
+    expect(systemItem(await captureBody(handle, true))).toEqual({
       role: "developer",
       content: [
         { type: "input_text", text: STATIC_TEXT, prompt_cache_breakpoint: { mode: "explicit" } },
@@ -1785,7 +1789,7 @@ describe("System prompt cache blocks", () => {
   ] as const)("leaves the OpenAI prompt whole for $name", async ({ model, options }) => {
     const handle = openAiHandle(model);
     const split = await captureBody(handle, true, options);
-    expect(JSON.parse(split).input[0]).toMatchObject({ content: RENDERED_TEXT });
+    expect(systemItem(split)).toMatchObject({ content: RENDERED_TEXT });
     expect(split).toBe(await captureBody(handle, false, options));
   }, 15000);
 

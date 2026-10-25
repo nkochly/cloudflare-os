@@ -96,7 +96,11 @@ function cachedForAnHour(block: unknown): unknown {
 
 function splitOpenAiResponsesInstructions(payload: object, staticText: string): object | undefined {
   if (!("input" in payload) || !Array.isArray(payload.input)) return undefined;
-  const [instructions, ...rest]: unknown[] = payload.input;
+  // Pi puts message-anchored items (additional_tools, which carry a role but no content) ahead of the system
+  // message, so it is the first item with content.
+  const input: unknown[] = payload.input;
+  const at = input.findIndex(item => typeof item === "object" && item !== null && "content" in item);
+  const instructions = input[at];
   if (typeof instructions !== "object" || instructions === null || !("role" in instructions) ||
       (instructions.role !== "developer" && instructions.role !== "system") ||
       !("content" in instructions) || !continuesPast(instructions.content, staticText)) {
@@ -104,15 +108,12 @@ function splitOpenAiResponsesInstructions(payload: object, staticText: string): 
   }
   return {
     ...payload,
-    input: [
-      {
-        ...instructions,
-        content: [
-          { type: "input_text", text: staticText, prompt_cache_breakpoint: { mode: "explicit" } },
-          { type: "input_text", text: instructions.content.slice(staticText.length) },
-        ],
-      },
-      ...rest,
-    ],
+    input: input.with(at, {
+      ...instructions,
+      content: [
+        { type: "input_text", text: staticText, prompt_cache_breakpoint: { mode: "explicit" } },
+        { type: "input_text", text: instructions.content.slice(staticText.length) },
+      ],
+    }),
   };
 }
