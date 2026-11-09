@@ -610,7 +610,8 @@ it("renews at once a subscription that a re-enabled hook finds past its renewal 
     await ada.hooks.chatEnableHook();
     const wake = await runInDurableObject(driver(),
       (_instance: unknown, state: DurableObjectState) => state.storage.getAlarm());
-    expect(wake).toBeLessThanOrEqual(Date.now());
+    // Lifecycle arms an overdue job for the next millisecond.
+    expect(wake).toBeLessThanOrEqual(Date.now() + 1);
   } finally {
     vi.useRealTimers();
   }

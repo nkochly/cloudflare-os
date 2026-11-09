@@ -15,8 +15,8 @@ export const MAX_DELIVERY_ATTEMPTS = 8;
 /** Duplicate pushes of a message that needs no further delivery are ignored for this long. */
 export const DELIVERED_RETENTION_MS = 24 * HOUR_MS;
 /**
- * Deliveries one run starts together; the rest stay due, so the alarm a driver reschedules for the
- * past takes them next.
+ * Deliveries one run starts together; the rest stay due, so the job a driver sets for the past
+ * takes them next.
  */
 export const MAX_DELIVERIES_PER_RUN = 20;
 /** Finished messages one run forgets once their dedupe window has passed; the rest stay due. */
@@ -55,18 +55,24 @@ const through = (index: string, time: number) => `${index}${timeKey(time + 1)}`;
 
 /**
  * Queued deliveries, stored under `msg:{hookKey}:{messageId}`, with the indexes the queue reads
- * them by under `queue:`. Hook keys must contain no `:` (drivers use UUIDs). The driver owns its
- * alarm: it calls `run()` from it, and sets it for `nextDue()` afterwards. A driver may delete what
- * the queue stores, as on disconnecting: an index entry whose row is gone is dropped when read.
+ * them by under `queue:`. Hook keys must contain no `:` (drivers use UUIDs). The driver runs it
+ * from its `DriverJob` (`./driver-job`): it calls `run()` from the job, then sets the job for
+ * `nextDue()`. A driver may delete what the queue stores, as on disconnecting: an index entry whose
+ * row is gone is dropped when read.
+ *
+ * The queue stays ours rather than one Lifecycle job per delivery: Lifecycle dispatches due jobs
+ * one at a time, where a run here starts up to `MAX_DELIVERIES_PER_RUN` together so one slow hook
+ * doesn't hold back the rest, and its retries are immediate where a delivery's back off over hours.
  *
  * @example
  * ```ts
  * #queue = new HookDeliveryQueue<Event>(this.ctx.storage.kv, () => logger.warn("dropped an event"));
  *
- * async alarm() {
- *   await this.#queue.run(Date.now(), (hookKey, event) => this.#deliver(hookKey, event));
- *   const next = this.#queue.nextDue();
- *   if (next !== undefined) await this.ctx.storage.setAlarm(next);
+ * async onJob(context: LifecycleJobContext) {
+ *   return this.#job.drive(context, async () => {
+ *     await this.#queue.run(Date.now(), (hookKey, event) => this.#deliver(hookKey, event));
+ *     await this.#job.set(this.#queue.nextDue());
+ *   }, error => logger.error("delivery run failed", { error }));
  * }
  * ```
  */
@@ -143,7 +149,7 @@ export class HookDeliveryQueue<Message> {
   }
 
   /**
-   * @returns The earliest time the queue needs the alarm (a pending `at`, or a finished row's
+   * @returns The earliest time the queue needs running again (a pending `at`, or a finished row's
    * expiry), or undefined.
    */
   nextDue(): number | undefined {

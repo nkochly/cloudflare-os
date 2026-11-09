@@ -55,6 +55,27 @@ function testInitiator(driver: ScheduleDriver): Fetcher<TestHooks> {
   return exports.TestHooks({});
 }
 
+/**
+ * When the driver's Lifecycle job is next due, or null with none. These tests read and move the
+ * job's row as they do the rest of the driver's storage.
+ */
+function jobDue(state: DurableObjectState): number | null {
+  const rows = [...state.storage.sql.exec<{ time: number }>(
+    "SELECT time FROM cf_agents_jobs WHERE id = 'deliver'")];
+  return rows[0]?.time ?? null;
+}
+
+/**
+ * Run the driver now, as its alarm would once due: the tests make rows due by rewriting them,
+ * ahead of the job's planned time, so the job is moved to now first.
+ */
+async function runDriver(driver: DurableObjectStub<ScheduleDriver>): Promise<boolean> {
+  await runInDurableObject(driver, (_instance, state) => {
+    state.storage.sql.exec("UPDATE cf_agents_jobs SET time = ? WHERE id = 'deliver'", Date.now());
+  });
+  return runDurableObjectAlarm(driver);
+}
+
 function enableSchedule(
   driver: DurableObjectStub<ScheduleDriver>,
   activation: ScheduleActivation,
@@ -140,7 +161,7 @@ async function revokeWhileDeliveryIsBlocked(
   await makeActiveScheduleDue(driver, "workspace-a", "schedule-a");
   await testEnv.TEST_HOOKS.blockAt(point);
 
-  const alarm = runDurableObjectAlarm(driver);
+  const alarm = runDriver(driver);
   try {
     await testEnv.TEST_HOOKS.waitUntilBlocked();
     await driver.revoke();
@@ -188,7 +209,7 @@ describe("ScheduleDriver", () => {
     await abortAllDurableObjects();
     driver = testEnv.SCHEDULE_DRIVER.getByName("reconstruction");
     await makeActiveScheduleDue(driver, "workspace-a", "schedule-a");
-    expect(await runDurableObjectAlarm(driver)).toBe(true);
+    expect(await runDriver(driver)).toBe(true);
 
     const stored = await driver.getSchedule("workspace-a", "schedule-a");
     expect(stored?.state).toMatchObject({ status: "active" });
@@ -233,14 +254,14 @@ describe("ScheduleDriver", () => {
     );
 
     now.mockReturnValue(sundayDelivery);
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
     expect((await driver.getSchedule("workspace-a", "weekly"))?.state).toMatchObject({
       status: "active",
       nextFire: wednesdayDelivery,
     });
 
     now.mockReturnValue(wednesdayDelivery);
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
     expect(
       (await testEnv.TEST_HOOKS.read()).events.filter((event) => event.startsWith("callback:")),
     ).toHaveLength(2);
@@ -264,7 +285,7 @@ describe("ScheduleDriver", () => {
     );
 
     await makeActiveScheduleDue(driver, "workspace-a", "one-shot");
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     expect((await driver.getSchedule("workspace-a", "one-shot"))?.state).toMatchObject({
       status: "expired",
@@ -317,9 +338,9 @@ describe("ScheduleDriver", () => {
     expect((await driver.listAccount())[0]?.gadgetId).toBeUndefined();
 
     await makeActiveScheduleDue(driver, "workspace-a", "schedule-a");
-    expect(await runDurableObjectAlarm(driver)).toBe(true);
+    expect(await runDriver(driver)).toBe(true);
     await makeActiveScheduleDue(driver, "workspace-a", "schedule-a");
-    expect(await runDurableObjectAlarm(driver)).toBe(true);
+    expect(await runDriver(driver)).toBe(true);
     expect(
       (await testEnv.TEST_HOOKS.read()).events.filter((event) => event.startsWith("callback:")),
     ).toHaveLength(2);
@@ -441,9 +462,9 @@ describe("ScheduleDriver", () => {
     await expect(driver.listWorkspace("workspace-a")).resolves.toEqual([
       expect.objectContaining({ scheduleId: "healthy" }),
     ]);
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
     expect((await testEnv.TEST_HOOKS.read()).callbackScheduleIds).toEqual(["healthy"]);
-    const alarm = await runInDurableObject(driver, (_instance, state) => state.storage.getAlarm());
+    const alarm = await runInDurableObject(driver, (_instance, state) => jobDue(state));
     expect(alarm).toBeGreaterThan(Date.now());
     expect(reportIssue).toHaveBeenCalledWith(
       "scheduler.schedule-row.unsupported",
@@ -479,7 +500,7 @@ describe("ScheduleDriver", () => {
     );
 
     await makeActiveScheduleDue(driver, "workspace-a", "schedule-a");
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     const stored = await driver.getSchedule("workspace-a", "schedule-a");
     expect(stored?.state).toMatchObject({
@@ -516,7 +537,7 @@ describe("ScheduleDriver", () => {
       activationTime,
     );
     await makeActiveScheduleDue(driver, "workspace-a", "one-shot");
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     const retrying = await driver.getSchedule("workspace-a", "one-shot");
     expect(retrying?.state).toMatchObject({ status: "retrying", attempts: 1 });
@@ -528,7 +549,7 @@ describe("ScheduleDriver", () => {
       if (stored.state.status !== "retrying") throw new Error("Expected retrying schedule");
       return { ...stored, state: { ...stored.state, nextAttempt: 1 } };
     });
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     expect((await driver.getSchedule("workspace-a", "one-shot"))?.state).toEqual(
       expect.objectContaining({ status: "completed" }),
@@ -576,7 +597,7 @@ describe("ScheduleDriver", () => {
       };
     });
 
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     expect((await driver.getSchedule("workspace-a", "schedule-a"))?.state).toMatchObject({
       status: "active",
@@ -616,7 +637,7 @@ describe("ScheduleDriver", () => {
       };
     });
 
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     expect((await driver.getSchedule("workspace-a", "schedule-a"))?.state).toMatchObject({
       status: "retrying",
@@ -658,7 +679,7 @@ describe("ScheduleDriver", () => {
       };
     });
 
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     expect((await driver.getSchedule("workspace-a", "schedule-a"))?.state).toMatchObject({
       status: "dead",
@@ -721,7 +742,7 @@ describe("ScheduleDriver", () => {
     });
     await testEnv.TEST_HOOKS.holdCallbacksUntilConcurrent(4);
 
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
     await vi.waitFor(async () => {
       const events = (await testEnv.TEST_HOOKS.read()).events;
       expect(events.filter((event) => event.startsWith("callback:"))).toHaveLength(21);
@@ -759,7 +780,7 @@ describe("ScheduleDriver", () => {
     );
     await makeActiveScheduleDue(driver, "workspace-a", "one-shot");
 
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     expect(debug).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -848,11 +869,11 @@ describe("ScheduleDriver", () => {
           });
         }
       });
-      return state.storage.getAlarm();
+      return jobDue(state);
     });
     expect(plannedAlarm).toBe(activationTime + 60_000);
 
-    await expect(runDurableObjectAlarm(driver)).resolves.toBe(true);
+    await expect(runDriver(driver)).resolves.toBe(true);
     const healthy = await driver.getSchedule("workspace-a", "healthy");
     expect(healthy?.state.status === "active" ? healthy.state.nextFire : 0).toBeGreaterThan(
       activationTime,
@@ -900,7 +921,7 @@ describe("ScheduleDriver", () => {
       state.storage.kv.delete("caps:workspace-a:schedule-a"),
     );
 
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     expect(reportIssue).toHaveBeenCalledWith(
       "scheduler.capabilities.missing",
@@ -917,25 +938,33 @@ describe("ScheduleDriver", () => {
     );
   });
 
-  it("reports and rethrows alarm infrastructure failures", async () => {
+  it("reports alarm infrastructure failures and runs again after the recovery delay", async () => {
     const driver = testEnv.SCHEDULE_DRIVER.getByName("alarm-failure");
+    const activationTime = Date.now();
+    await enableSchedule(
+      driver,
+      {
+        workspaceId: "workspace-a",
+        scheduleId: "schedule-a",
+        spec: { kind: "interval", everyMs: 60_000, anchorMs: activationTime },
+        title: "Failing run",
+        description: "Retry a run that throws.",
+        gadgetId,
+      },
+      activationTime,
+    );
     await runInDurableObject(driver, (_instance, state) =>
       state.storage.kv.put("metadata", { schemaVersion: 999, revoked: false }),
     );
 
-    const failure = await runInDurableObject(driver, async (instance) => {
-      try {
-        await instance.alarm();
-        return "did not reject";
-      } catch (error) {
-        return error instanceof Error ? error.message : String(error);
-      }
-    });
+    const ranAt = Date.now();
+    await runDriver(driver);
 
-    expect(failure).toContain("Unsupported scheduler driver metadata");
+    const due = await runInDurableObject(driver, (_instance, state) => jobDue(state));
+    expect(due).toBeGreaterThanOrEqual(ranAt + 5 * 60_000);
     expect(reportIssue).toHaveBeenCalledWith(
       "scheduler.alarm",
-      expect.any(Error),
+      expect.objectContaining({ message: expect.stringContaining("Unsupported scheduler driver metadata") }),
       expect.objectContaining({
         attributes: expect.objectContaining({
           accountId: expect.any(String),
@@ -996,12 +1025,23 @@ describe("ScheduleDriver", () => {
     const driver = testEnv.SCHEDULE_DRIVER.getByName("failed-enable-alarm");
 
     const result = await runInDurableObject(driver, async (instance, state) => {
-      // Read the clock in the object: workerd moves a past alarm to now. A minute out, the alarm
-      // can't fire during the test and stays inside enable's five-minute recovery deadline.
+      // Read the clock in the object. A minute out, the first schedule's firing can't come due
+      // during the test and stays inside enable's five-minute recovery deadline.
       const now = Date.now();
       const earlierAlarm = now + 60_000;
-      await state.storage.setAlarm(earlierAlarm);
-      const armed = await state.storage.getAlarm();
+      await instance.enable(
+        {
+          workspaceId: "workspace-a",
+          scheduleId: "valid",
+          spec: { kind: "interval", everyMs: 60_000, anchorMs: now },
+          title: "Valid task",
+          description: "Plan a firing a minute out.",
+          gadgetId,
+        },
+        testInitiator(instance),
+        now,
+      );
+      const armed = jobDue(state);
       let message = "did not reject";
       try {
         await instance.enable(
@@ -1019,7 +1059,7 @@ describe("ScheduleDriver", () => {
       } catch (error) {
         message = error instanceof Error ? error.message : String(error);
       }
-      return { earlierAlarm, armed, message, alarm: await state.storage.getAlarm() };
+      return { earlierAlarm, armed, message, alarm: jobDue(state) };
     });
 
     expect(result.armed).toBe(result.earlierAlarm);
@@ -1159,7 +1199,7 @@ describe("ScheduleDriver", () => {
     expect(before).toBeDefined();
 
     await makeActiveScheduleDue(driver, "workspace-a", "one-shot");
-    await runDurableObjectAlarm(driver);
+    await runDriver(driver);
 
     expect((await driver.getSchedule("workspace-a", "one-shot"))?.state.status).toBe("completed");
     // The schedule can never fire again, so its stored capability must not outlive it.

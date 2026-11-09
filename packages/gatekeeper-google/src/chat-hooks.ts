@@ -9,10 +9,12 @@
 // controller living outside the facet.
 //
 // One `ChatHookDriver` per space holds its enabled hooks and subscriptions, collapses duplicate
-// pushes, and retries failed deliveries from its alarm.
+// pushes, and retries failed deliveries from its one Lifecycle job (`DriverJob`).
 
 import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
+import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
+import { DriverJob } from "@gadgets/gatekeeper-kit/driver-job";
 import { HookDeliveryQueue, disposeStubs } from "@gadgets/gatekeeper-kit/hook-delivery-queue";
 import { SingleFlight } from "@gadgets/gatekeeper-kit/single-flight";
 import type {
@@ -104,11 +106,17 @@ const forgottenKey = (userObjectId: string) => `forgotten:${userObjectId}`;
 const DISCONNECTED = "This Google account has been disconnected.";
 
 export class ChatHookDriver extends DurableObject<Env> {
+  readonly #job = new DriverJob(Lifecycle.install(this), this.ctx, "drive");
   /** Subscription creations in flight, by account, which concurrent enables and renewals join. */
   #subscribing = new SingleFlight();
   #queue = new HookDeliveryQueue<ChatMessageRaw>(this.ctx.storage.kv, () => {
     logger.warn("dropped a Chat message after repeated delivery failures", { event: "chat.hooks.delivery.dropped" });
   });
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    ctx.blockConcurrencyWhile(() => this.#job.start());
+  }
 
   async register(key: string, registration: Registration, capabilities: Capabilities): Promise<void> {
     await this.#track(registration.userObjectId, registration.spaceName);
@@ -118,7 +126,7 @@ export class ChatHookDriver extends DurableObject<Env> {
       // Disconnected meanwhile, when its hooks were dropped.
       if (this.ctx.storage.kv.get(forgottenKey(registration.userObjectId)) !== undefined) throw new Error(DISCONNECTED);
     }
-    // Nothing from here to the registration awaits, so neither a disconnect nor the alarm, which
+    // Nothing from here to the registration awaits, so neither a disconnect nor the job, which
     // drops an expired subscription no hook uses, can come between the subscription and it.
     const replaced = this.ctx.storage.kv.get<Capabilities>(capabilitiesKey(key));
     this.ctx.storage.kv.put(registrationKey(key), registration);
@@ -169,14 +177,20 @@ export class ChatHookDriver extends DurableObject<Env> {
   }
 
   /**
-   * The driver's one alarm, which #wakeBy() and #reschedule() set for the earliest time any of
+   * The driver's one job, which #wakeBy() and #reschedule() set for the earliest time any of
    * these is due:
    * - delivering each queued message whose (re)try time has come, with backoff on failure;
    * - forgetting finished messages once the 24-hour dedupe window has passed;
    * - renewing each subscription some hook still uses, retrying soon if renewal fails;
    * - dropping expired subscriptions no hook uses any more.
    */
-  async alarm(): Promise<void> {
+  async onJob(context: LifecycleJobContext): Promise<LifecycleJobOutcome> {
+    return this.#job.drive(context, () => this.#run(), error => {
+      logger.error("a Chat hook driver run failed", { event: "chat.hooks.run.failed", error });
+    });
+  }
+
+  async #run(): Promise<void> {
     await this.#trackAccounts();
     const now = Date.now();
     await this.#queue.run(now, (hookKey, message) => this.#deliver(hookKey, message));
@@ -217,7 +231,7 @@ export class ChatHookDriver extends DurableObject<Env> {
   /**
    * Tell each account with hooks here that this driver holds them, as register() does, and again
    * each TRACKING_RECHECK_MS. A hook registered before accounts kept track has no record of it,
-   * which disconnecting its account needs to reach it; failing, it is told at the next alarm. An
+   * which disconnecting its account needs to reach it; failing, it is told at the next run. An
    * account disconnected without dropping its hooks here, before it could be told or by a
    * disconnect that couldn't reach this driver, has them dropped now.
    */
@@ -301,8 +315,7 @@ export class ChatHookDriver extends DurableObject<Env> {
   }
 
   async #wakeBy(time: number): Promise<void> {
-    const current = await this.ctx.storage.getAlarm();
-    if (current === null || time < current) await this.ctx.storage.setAlarm(time);
+    await this.#job.wakeBy(time);
   }
 
   async #reschedule(): Promise<void> {
@@ -313,7 +326,7 @@ export class ChatHookDriver extends DurableObject<Env> {
     for (const [key, subscription] of this.ctx.storage.kv.list<Subscription>({ prefix: "sub:" })) {
       times.push(authorities.has(key.slice("sub:".length)) ? subscription.renewAt : subscription.expireTime);
     }
-    if (times.length > 0) await this.ctx.storage.setAlarm(Math.min(...times));
+    await this.#job.set(times.length > 0 ? Math.min(...times) : undefined);
   }
 }
 

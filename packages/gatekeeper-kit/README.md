@@ -86,7 +86,8 @@ import {
 | `./action-description` | Approval-text builder: prose plus exact typed fields under one byte budget, and the `descriptionIsComplete` claim. | An action's `describe` renders what it will write or send. |
 | `./simulation` | Pending-action replay and provisional-ID mapping. | An action continues with simulation and later reads must include its projected effect. |
 | `./observers` | Observer admission strategies and per-read authorization. | A gatekeeper implements its required observer methods. |
-| `./hook-delivery-queue` | Per-hook queue of pushed events: deduplication, retry with backoff, and bounded delivery runs from the driver's alarm. | A hook driver delivers provider pushes through `HookInitiator.startHook()`. |
+| `./driver-job` | A driver Durable Object's one `agents` Lifecycle job in place of its alarm: due at the earliest time any of its concerns needs it, retried after a failed run. | A named driver (`getByName()`) has several timed concerns, such as delivery retries and subscription renewals. |
+| `./hook-delivery-queue` | Per-hook queue of pushed events: deduplication, retry with backoff, and bounded delivery runs from the driver's `DriverJob`. | A hook driver delivers provider pushes through `HookInitiator.startHook()`. |
 | `./oauth-client` | OAuth 2.0 token-endpoint client, PKCE, and refresh adapter. | A gatekeeper exchanges, refreshes, or revokes OAuth 2.0 tokens. |
 | `./preview-oauth` | Signed OAuth state and stable-to-preview callback relay. | Preview Workers share one callback registered with the OAuth provider. |
 | `./endpoint` | User-supplied provider endpoint normalization, and agent-supplied path-segment encoding (`pathSegment`, `pathSegments`). | A user enters a self-hosted provider URL, or an agent-supplied id goes into a request path. |

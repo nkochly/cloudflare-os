@@ -1,4 +1,5 @@
 import { createExecutionContext, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import type { LifecycleJob } from "agents/lifecycle";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ObservationGate, privateObservers } from "@gadgets/gatekeeper-kit/observers";
 import type { GatekeeperUserSelectionExchange } from "@gadgets/workshop-shared/gatekeeper";
@@ -21,6 +22,40 @@ beforeEach(() => {
 
 // A rejected Durable Object RPC promise is a proxy that assertions would probe into further,
 // unhandled, calls; settle it into a plain promise first.
+/**
+ * When the collection's cleanup job is next due, or null with none. These tests read and move the
+ * job's row as they do the rest of the collection's storage.
+ */
+function cleanupDue(state: DurableObjectState): number | null {
+  // A deleted collection has no job table either.
+  let table = [...state.storage.sql.exec(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cf_agents_jobs'")];
+  if (table.length === 0) return null;
+  let rows = [...state.storage.sql.exec<{ time: number }>(
+    "SELECT time FROM cf_agents_jobs WHERE id = 'cleanup'")];
+  return rows[0]?.time ?? null;
+}
+
+/** Make the cleanup job due now, ahead of its retry time, so the next alarm runs it. */
+function dueNow(state: DurableObjectState): void {
+  state.storage.sql.exec("UPDATE cf_agents_jobs SET time = ? WHERE id = 'cleanup'", Date.now());
+}
+
+/**
+ * Run the cleanup job on `instance`, a second object over the same state that stands for the
+ * object after a restart. The job is dispatched directly: the second object's own Lifecycle can't
+ * start while the first object's call holds the state.
+ */
+function runCleanupIn(instance: ContextCollectionDurableObject): Promise<unknown> {
+  return instance.onJob({ job: { fn: "cleanup" } as LifecycleJob, attempt: 1 });
+}
+
+/** Run the collection's cleanup now, as its alarm would once due. */
+async function runCleanup(stub: DurableObjectStub<ContextCollectionDurableObject>): Promise<boolean> {
+  await runInDurableObject(stub, (_instance, state) => dueNow(state));
+  return runDurableObjectAlarm(stub);
+}
+
 function settled(rpc: PromiseLike<unknown>): Promise<unknown> {
   let { promise, resolve, reject } = Promise.withResolvers<unknown>();
   rpc.then(resolve, reject);
@@ -466,13 +501,13 @@ describe("collection sharing", () => {
         try {
           await entered.promise;
           expect(instance.getAccess("bob").role).toBeNull();
-          expect(await state.storage.getAlarm()).not.toBeNull();
+          expect(cleanupDue(state)).not.toBeNull();
           let restarted = new ContextCollectionDurableObject(state, testEnv);
-          await restarted.alarm();
+          await runCleanupIn(restarted);
           expect(canReadCollection(restarted.getAccess("stranger"))).toBe(false);
           expect(await restarted.getContextDocument("plan.md")).toBeNull();
           expect((await state.storage.list()).size).toBe(0);
-          expect(await state.storage.getAlarm()).toBeNull();
+          expect(cleanupDue(state)).toBeNull();
         } finally {
           resume.resolve();
           await removal;
@@ -518,12 +553,12 @@ describe("git tokens of members who lose write access", () => {
           expect(artifacts.activeTokens.has(token.id)).toBe(true);
           expect((await instance.getAccess("bob")).role)
             .toBe(operation === "demotion" || operation === "share" ? "viewer" : null);
-          expect(await state.storage.getAlarm()).not.toBeNull();
+          expect(cleanupDue(state)).not.toBeNull();
 
           let restarted = new ContextCollectionDurableObject(state, { ...testEnv, ARTIFACTS: artifacts.binding });
-          await restarted.alarm();
+          await runCleanupIn(restarted);
           expect(artifacts.activeTokens.has(token.id)).toBe(false);
-          expect(await state.storage.getAlarm()).toBeNull();
+          expect(cleanupDue(state)).toBeNull();
           if (operation === "last member") expect((await state.storage.list()).size).toBe(0);
         } finally {
           paused.release();
@@ -558,9 +593,9 @@ describe("git tokens of members who lose write access", () => {
           await entered.promise;
           expect((await instance.getAccess("bob")).role).toBeNull();
           expect(artifacts.activeTokens.has(token.id)).toBe(true);
-          expect(await state.storage.getAlarm()).not.toBeNull();
+          expect(cleanupDue(state)).not.toBeNull();
           let restarted = new ContextCollectionDurableObject(state, { ...testEnv, ARTIFACTS: artifacts.binding });
-          await restarted.alarm();
+          await runCleanupIn(restarted);
           expect(artifacts.activeTokens.has(token.id)).toBe(false);
         } finally {
           resume.resolve();
@@ -590,13 +625,18 @@ describe("git tokens of members who lose write access", () => {
       expect(artifacts.activeTokens.has(token.id)).toBe(true);
       expect(canReadCollection(await stub.getAccess("bob"))).toBe(false);
       await runInDurableObject(stub, async (_instance, state) => {
-        expect(await state.storage.getAlarm()).not.toBeNull();
+        expect(cleanupDue(state)).not.toBeNull();
       });
 
-      await expect(runDurableObjectAlarm(stub)).rejects.toThrow("Artifacts is unavailable.");
+      // A failed run stays due, to be tried again.
+      expect(await runCleanup(stub)).toBe(true);
+      expect(artifacts.activeTokens.has(token.id)).toBe(true);
+      await runInDurableObject(stub, async (_instance, state) => {
+        expect(cleanupDue(state)).not.toBeNull();
+      });
       artifacts.failRevocations = false;
       artifacts.failDeletion = false;
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(await runCleanup(stub)).toBe(true);
       expect(artifacts.activeTokens.has(token.id)).toBe(false);
       await runInDurableObject(stub, async (_instance, state) => {
         expect((await state.storage.list()).size).toBe(0);
@@ -635,7 +675,7 @@ describe("git tokens of members who lose write access", () => {
     expect(artifacts.revoked).not.toContain(token.id);
 
     artifacts.failRevocations = false;
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runCleanup(stub)).toBe(true);
     expect(artifacts.revoked).toContain(token.id);
     await stub.removeMember("alice", "bob");
   });
@@ -733,7 +773,7 @@ describe("git tokens of members who lose write access", () => {
     expect(artifacts.activeTokens.has(token.id)).toBe(true);
     artifacts.failDeletion = false;
     artifacts.failRevocations = false;
-    await runDurableObjectAlarm(stub);
+    await runCleanup(stub);
     expect(artifacts.activeTokens.has(token.id)).toBe(false);
     await expect(settled(library("bob").addSharedCollection(other))).rejects.toThrow("disconnected");
   });
@@ -744,15 +784,15 @@ describe("git tokens of members who lose write access", () => {
     await stub.createGitToken("bob");
     artifacts.failDeletion = true;
     await expect(settled(stub.deleteSelf("alice", false))).rejects.toThrow("Artifacts is unavailable");
-    let retryAt = Date.now() + 60_000;
-    await runInDurableObject(stub, async (_instance, state) => {
+    let retryAt = await runInDurableObject(stub, async (_instance, state) => {
       state.storage.kv.put("gitTokenRevokeAttempts", 12);
-      await state.storage.setAlarm(retryAt);
+      return cleanupDue(state);
     });
+    expect(retryAt).not.toBeNull();
     artifacts.failRevocations = true;
     await stub.removeAccount("bob");
     await runInDurableObject(stub, async (_instance, state) => {
-      expect(await state.storage.getAlarm()).toBe(retryAt);
+      expect(cleanupDue(state)).toBe(retryAt);
     });
   });
 

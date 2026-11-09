@@ -17,6 +17,7 @@
     "./credential-stage": "./src/credential-stage.ts",
     "./credentials": "./src/credentials.ts",
     "./cursors": "./src/cursors.ts",
+    "./driver-job": "./src/driver-job.ts",
     "./endpoint": "./src/endpoint.ts",
     "./git-diff": "./src/git-diff.ts",
     "./git-objects": "./src/git-objects.ts",
@@ -40,6 +41,7 @@
   "dependencies": {
     "@gadgets/observability": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
+    "agents": "0.33.0",
     "diff": "catalog:",
     "jose": "^6.2.12"
   },
