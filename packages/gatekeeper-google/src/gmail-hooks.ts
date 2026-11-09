@@ -11,6 +11,8 @@
 
 import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
+import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
+import { DriverJob } from "@gadgets/gatekeeper-kit/driver-job";
 import { HookDeliveryQueue, disposeStubs } from "@gadgets/gatekeeper-kit/hook-delivery-queue";
 import { SingleFlight } from "@gadgets/gatekeeper-kit/single-flight";
 import type {
@@ -87,7 +89,7 @@ const WATCH_RENEW_RETRY_MS = HOUR_MS;
 /** Pushes can be delayed or dropped, so the history is read at least this often. */
 const SAFETY_SYNC_INTERVAL_MS = HOUR_MS;
 const SYNC_RETRY_MS = 5 * MINUTE_MS;
-/** Bounds one alarm's history read; the next alarm, set for at once, continues it. */
+/** Bounds one run's history read; the next run, set for at once, continues it. */
 const MAX_HISTORY_PAGES_PER_SYNC = 10;
 /**
  * How often each account with hooks here is asked again whether it knows of this driver: hooks its
@@ -138,10 +140,16 @@ class MailboxChangedError extends Error {
  * depends on.
  */
 export class GmailHookDriver extends DurableObject<Env> {
+  readonly #job = new DriverJob(Lifecycle.install(this), this.ctx, "drive");
   #watching = new SingleFlight();
   #queue = new HookDeliveryQueue<string>(this.ctx.storage.kv, () => {
     logger.warn("dropped a Gmail message after repeated delivery failures", { event: "gmail.hooks.delivery.dropped" });
   });
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    ctx.blockConcurrencyWhile(() => this.#job.start());
+  }
 
   async register(key: string, registration: Omit<Registration, "since">, capabilities: Capabilities): Promise<void> {
     const kv = this.ctx.storage.kv;
@@ -203,14 +211,20 @@ export class GmailHookDriver extends DurableObject<Env> {
   }
 
   /**
-   * The driver's one alarm, which #wakeBy() and #reschedule() set for the earliest time any of
+   * The driver's one job, which #wakeBy() and #reschedule() set for the earliest time any of
    * these is due:
    * - reading new history, when a push reported some or hourly, and queueing what it added;
    * - renewing the mailbox's watch while any hook uses it, retrying hourly if renewal fails;
    * - forgetting an expired watch no hook uses any more;
    * - delivering each queued message whose (re)try time has come, and forgetting finished ones.
    */
-  async alarm(): Promise<void> {
+  async onJob(context: LifecycleJobContext): Promise<LifecycleJobOutcome> {
+    return this.#job.drive(context, () => this.#run(), error => {
+      logger.error("a Gmail hook driver run failed", { event: "gmail.hooks.run.failed", error });
+    });
+  }
+
+  async #run(): Promise<void> {
     const kv = this.ctx.storage.kv;
     await this.#trackAccounts();
     if (this.#registrations().length > 0 && (kv.get<number>("syncAt") ?? 0) <= Date.now()) await this.#sync();
@@ -357,7 +371,7 @@ export class GmailHookDriver extends DurableObject<Env> {
   /**
    * Tell each account with hooks here that this driver holds them, as register() does, and again
    * each TRACKING_RECHECK_MS. A hook registered before accounts kept track has no record of it,
-   * which disconnecting its account needs to reach it; failing, it is told at the next alarm. An
+   * which disconnecting its account needs to reach it; failing, it is told at the next run. An
    * account disconnected without dropping its hooks here, before it could be told or by a
    * disconnect that couldn't reach this driver, has them dropped now.
    */
@@ -440,8 +454,7 @@ export class GmailHookDriver extends DurableObject<Env> {
   }
 
   async #wakeBy(time: number): Promise<void> {
-    const current = await this.ctx.storage.getAlarm();
-    if (current === null || time < current) await this.ctx.storage.setAlarm(time);
+    await this.#job.wakeBy(time);
   }
 
   async #reschedule(): Promise<void> {
@@ -455,7 +468,7 @@ export class GmailHookDriver extends DurableObject<Env> {
     } else if (watch) {
       times.push(watch.expiration);
     }
-    if (times.length > 0) await this.ctx.storage.setAlarm(Math.min(...times));
+    await this.#job.set(times.length > 0 ? Math.min(...times) : undefined);
   }
 }
 

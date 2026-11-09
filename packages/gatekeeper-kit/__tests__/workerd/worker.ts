@@ -1,6 +1,8 @@
 // Fixture for the suites that need real Durable Object storage rather than the cloning Node fake.
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
+import { DriverJob } from "../../src/driver-job";
 import { ObserverTracker } from "../../src/observers";
 export { ConformanceAccount, ConformanceResource, ConformanceVerifier } from "./conformance/gatekeeper";
 
@@ -71,3 +73,33 @@ export class TrackerHost extends DurableObject {
 export default {
   fetch: () => new Response("fixture", { status: 404 }),
 };
+
+/** A driver over `DriverJob`, whose runs the tests script. */
+export class DriverJobHost extends DurableObject {
+  readonly #job = new DriverJob(Lifecycle.install(this), this.ctx, "drive", { failureRetryMs: 60_000 });
+  #runs = 0;
+  #fail = false;
+  #next: number | undefined;
+
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+    super(ctx, env);
+    ctx.blockConcurrencyWhile(() => this.#job.start());
+  }
+
+  async onJob(context: LifecycleJobContext): Promise<LifecycleJobOutcome> {
+    return this.#job.drive(context, async () => {
+      this.#runs++;
+      if (this.#fail) throw new Error("run failed");
+      await this.#job.set(this.#next);
+    }, () => {});
+  }
+
+  due(): number | undefined { return this.#job.due(); }
+  runs(): number { return this.#runs; }
+  wakeBy(time: number): Promise<void> { return this.#job.wakeBy(time); }
+  script(options: { fail?: boolean; next?: number }): void {
+    this.#fail = options.fail ?? false;
+    this.#next = options.next;
+  }
+  destroy(): Promise<void> { return this.#job.destroy(); }
+}

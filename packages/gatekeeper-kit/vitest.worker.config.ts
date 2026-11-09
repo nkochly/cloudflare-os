@@ -10,6 +10,7 @@ export default defineConfig({
       compatibilityFlags: ["allow_irrevocable_stub_storage"],
       durableObjects: {
         TRACKER_HOST: { className: "TrackerHost", useSQLite: true },
+        DRIVER_JOB_HOST: { className: "DriverJobHost", useSQLite: true },
         CONFORMANCE_ACCOUNT: { className: "ConformanceAccount", useSQLite: true },
         CONFORMANCE_RESOURCE: { className: "ConformanceResource", useSQLite: true },
       },

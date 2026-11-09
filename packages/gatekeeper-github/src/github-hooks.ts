@@ -14,6 +14,11 @@
 // and retries failed deliveries from its alarm. Hourly, it checks each webhook on GitHub, restoring
 // one that someone has changed and asking GitHub to redeliver what GitHub failed to deliver.
 // Disconnecting the account deletes its webhooks.
+//
+// The driver keeps its own alarm rather than an `agents` Lifecycle job, as the Google drivers do:
+// a webhook delivery reaches it by its id (the route above), which carries no name, and Lifecycle
+// refuses to start on an object without one. The route is also each webhook's identity on GitHub
+// (found by URL), so routing by name instead would orphan every webhook already registered.
 
 import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";

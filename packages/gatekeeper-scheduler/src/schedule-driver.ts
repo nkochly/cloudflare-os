@@ -1,5 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { RpcStub, RpcTarget } from "cloudflare:workers";
+import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
+import { DriverJob } from "@gadgets/gatekeeper-kit/driver-job";
 import { reportIssue } from "@gadgets/observability/error-reporting";
 import type { ApprovalQueue, HookInitiator } from "@gadgets/workshop-shared/gatekeeper";
 import {
@@ -79,7 +81,24 @@ type PreparedRun = {
 type PendingState = Extract<EnabledSchedule, { status: "pending" }>;
 type PendingStage = PendingState["stage"];
 
+/**
+ * One per scheduler account. Its alarm is a `DriverJob`, due at the earliest firing any schedule
+ * needs. Calendar and one-off schedules fire in their own time zone, which the `agents` Scheduler's
+ * UTC-only cron can't express, so the cadence arithmetic (`driver-state.ts`) stays ours and only
+ * the timer is the SDK's. A run that outlives `RECOVERY_DELAY_MS` counts as hung, and Lifecycle
+ * runs the job again.
+ */
 export class ScheduleDriver extends DurableObject {
+  readonly #job = new DriverJob(Lifecycle.install(this), this.ctx, "deliver", {
+    hungTimeoutSeconds: RECOVERY_DELAY_MS / 1000,
+    failureRetryMs: RECOVERY_DELAY_MS,
+  });
+
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+    super(ctx, env);
+    ctx.blockConcurrencyWhile(() => this.#job.start());
+  }
+
   async enable(
     activation: ScheduleActivation,
     initiator: ScheduleInitiator,
@@ -213,7 +232,7 @@ export class ScheduleDriver extends DurableObject {
   async revoke(): Promise<void> {
     await obsContext.with({ accountId: this.ctx.id.toString(), operation: "revoke" }, async () => {
       try {
-        await this.ctx.storage.setAlarm(Date.now());
+        await this.#job.set(Date.now());
         this.ctx.storage.transactionSync(() => {
           const metadata = this.#requireMetadata();
           if (metadata.revoked) return;
@@ -234,7 +253,12 @@ export class ScheduleDriver extends DurableObject {
     });
   }
 
-  async alarm(): Promise<void> {
+  async onJob(context: LifecycleJobContext): Promise<LifecycleJobOutcome> {
+    // A run that throws has reported itself; the job is tried again after RECOVERY_DELAY_MS.
+    return this.#job.drive(context, () => this.#alarm(), () => {});
+  }
+
+  async #alarm(): Promise<void> {
     await obsContext.with({ accountId: this.ctx.id.toString(), operation: "alarm" }, async () => {
       const startedAt = Date.now();
       try {
@@ -270,7 +294,6 @@ export class ScheduleDriver extends DurableObject {
     startHookRejectedCount: number;
   }> {
     const now = Date.now();
-    await this.ctx.storage.setAlarm(checkedAdd(now, RECOVERY_DELAY_MS));
     if (this.#requireMetadata().revoked) {
       await this.#cleanupRevokedAccount();
       return { dueCount: 0, batchSize: 0, backlogCount: 0, startHookRejectedCount: 0 };
@@ -281,8 +304,8 @@ export class ScheduleDriver extends DurableObject {
       .toSorted(compareDueSchedules);
     const batch = due.slice(0, ALARM_BATCH_SIZE);
 
-    // An alarm cannot overlap its own live handler, so an immediate write would not bypass a hung
-    // callback. Rev1 relies on the recovery watchdog and replans after a successful batch.
+    // A run is single-flight, so an immediate write would not bypass a hung callback. Lifecycle
+    // runs the job again once this run has taken RECOVERY_DELAY_MS, and replans after a batch.
     let startHookRejectedCount = 0;
     // A hung callback stalls this entire per-account batch. Stronger isolation is deferred beyond
     // rev1; ordinary work remains bounded to four concurrent deliveries.
@@ -312,8 +335,7 @@ export class ScheduleDriver extends DurableObject {
 
   async #armRecoveryAlarm(deadline: number): Promise<void> {
     try {
-      const existing = await this.ctx.storage.getAlarm();
-      if (existing === null || deadline < existing) await this.ctx.storage.setAlarm(deadline);
+      await this.#job.wakeBy(deadline);
     } catch (error) {
       logger.error("scheduler recovery alarm failed", {
         event: "scheduler.alarm.arm.failed",
@@ -549,7 +571,7 @@ export class ScheduleDriver extends DurableObject {
   async #planAlarm(): Promise<void> {
     const metadata = this.#requireMetadata();
     if (metadata.revoked) {
-      await this.ctx.storage.setAlarm(Date.now());
+      await this.#job.set(Date.now());
       return;
     }
     let target: number | undefined;
@@ -558,8 +580,7 @@ export class ScheduleDriver extends DurableObject {
       if (candidate !== undefined && (target === undefined || candidate < target))
         target = candidate;
     }
-    if (target === undefined) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(target);
+    await this.#job.set(target);
   }
 
   async #cleanupRevokedAccount(): Promise<void> {
@@ -576,8 +597,7 @@ export class ScheduleDriver extends DurableObject {
     const remains = [...this.ctx.storage.kv.list({ limit: 2 })].some(
       ([key]) => key !== METADATA_KEY,
     );
-    if (remains) await this.ctx.storage.setAlarm(Date.now());
-    else await this.ctx.storage.deleteAlarm();
+    await this.#job.set(remains ? Date.now() : undefined);
   }
 
   #readSchedule(key: string): StoredSchedule | undefined {

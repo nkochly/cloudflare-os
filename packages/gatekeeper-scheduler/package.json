@@ -13,8 +13,10 @@
   },
   "dependencies": {
     "@gadgets/error-reporting": "workspace:*",
+    "@gadgets/gatekeeper-kit": "workspace:*",
     "@gadgets/observability": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
+    "agents": "0.33.0",
     "capnweb": "catalog:",
     "capnweb-validate": "catalog:",
     "temporal-polyfill": "1.0.2"
