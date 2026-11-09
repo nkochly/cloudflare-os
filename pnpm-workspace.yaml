@@ -39,7 +39,7 @@ catalog:
   # drives. Playwright's browsers are not dependencies: `playwright install chromium` fetches them.
   '@vitest/browser-playwright': ^5.0.5
   playwright: ^1.64.0
-  wrangler: 4.156.0
+  wrangler: 4.158.0
   zod: 4.6.7
 
 overrides:
