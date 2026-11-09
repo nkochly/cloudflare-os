@@ -18,6 +18,9 @@ through logs and errors, then everything else.
   from the real type instead, or rethink the design.
 - Prefer reusing an existing mechanism over adding a parallel one; say which existing mechanism the
   change should have used.
+- Flag code that does what an SDK we pin already provides (`agents` lifecycle, schedules, queue,
+  tasks, websockets, state, routing; `@modelcontextprotocol/server/ext/skills`), or an SDK pin that
+  differs from the Trifecta `ECOSYSTEM.md`. Hand-roll only what no SDK offers, and say so.
 - A large kernel change should be split by concern into separate PRs, and at minimum grouped into
   commits that let `workshop-backend`/`workshop-shared` be reviewed apart from UI. Flag PRs that
   bundle both.
