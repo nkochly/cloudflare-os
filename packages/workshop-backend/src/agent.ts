@@ -8,10 +8,11 @@ import { AgentCatalog, ObservationDescription } from '@gadgets/workshop-shared/g
 import { createWorkshopLogger, obsContext } from "./observability";
 import { createTracer } from "@gadgets/observability/tracing";
 import {
-  Type, getSystemMessageText, isRetryableAssistantError, toToolDeclaration,
+  getSystemMessageText, isRetryableAssistantError, toToolDeclaration,
 } from "@earendil-works/pi-ai";
+import { Type, type TSchema } from "typebox";
 import type {
-  AssistantMessage, ImageContent, Message, SystemMessage, TSchema, TextContent, ToolCall,
+  AssistantMessage, ImageContent, Message, SystemMessage, TextContent, ToolCall,
   ToolResultMessage, Usage,
 } from "@earendil-works/pi-ai";
 import {
