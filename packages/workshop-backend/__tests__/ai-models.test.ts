@@ -3,8 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SUGGESTED_MODELS, type AiChatAuthorInfo, type AiModelConfig, type BuiltInReasoning,
 } from "@gadgets/workshop-shared/api";
+import { Type } from "typebox";
 import {
-  Type, type AssistantMessage, type ClassifierContext, type ToolResultMessage,
+  type AssistantMessage, type ClassifierContext, type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
@@ -753,7 +754,8 @@ describe("gateway model reasoning levels", () => {
     role: "user",
     content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }],
   };
-  // pi sends a managed-effort Claude its effort in a system message; the top-level one is fixed.
+  // pi sends a managed-effort Claude its effort in a system message; the top-level one is fixed at
+  // "low", so an organization's effort cap never refuses the request.
   const opusBody = (effort: string) => ({
     model: OPUS.model,
     messages: [CLAUDE_HELLO, { role: "system", content: [], output_config: { effort } }],
@@ -762,7 +764,7 @@ describe("gateway model reasoning levels", () => {
       type: "adaptive", display: "summarized",
       block_binding: { prefix_mismatch_behavior: "drop_block" },
     },
-    output_config: { effort: "high" },
+    output_config: { effort: "low" },
   });
   const claudeBody = (config: GatewayConfig, max_tokens: number, extra: object = {}) =>
       ({ model: config.model, messages: [CLAUDE_HELLO], max_tokens, stream: true, ...extra });
