@@ -11,10 +11,11 @@ repo goes there, in the pull request that introduces it.
 
 The Trifecta is several repos that run as one system: wiki_mcp, Muster,
 microsite-kit, Executor, activity, wallflower, artifacts-quick, always-on-agent,
-Cloudflare OS, and the CI repos. This core is the same, byte for byte, in every
-repo's `GLOSSARY.md`. Its one source is `wiki_mcp/GLOSSARY.md`; change it there
-and run `npm run glossary:sync` in wiki_mcp, which writes every copy and the
-digest each repo's check holds it to. Never edit the core in a copy.
+Cloudflare OS, universe, and the CI repos. This core is the same, byte for
+byte, in every repo's `GLOSSARY.md`. Its one source is `wiki_mcp/GLOSSARY.md`;
+change it there and run `npm run glossary:sync` in wiki_mcp, which writes every
+copy and the digest each repo's check holds it to. Never edit the core in a
+copy.
 
 How to use this file:
 
@@ -132,6 +133,24 @@ These are the Trifecta's names for what agents meet through it.
   (`sort_feedback`). always-on-agent calls these "Jev checks", microsite-kit
   "findings".
 
+### The universe
+
+- **universe**: One team's wiki pages and Muster tasks drawn as one
+  read-only 3D picture, as the signed-in person's own grants let them read.
+  The team is at the centre, its customer accounts and projects orbit it,
+  and each page and task orbits its customer account or project. It writes
+  nothing and decides nothing: every act opens the Muster app, and what
+  changed over time stays in Activity's feed.
+  *Not:* a dashboard of counts, a status view, a second task screen, or a
+  wiki. Never "galaxy", "map" or "graph".
+  *Code:* repo `universe` (`Universe` in `src/model/universe.ts`), Worker
+  and package `universe`, host `universe.<domain>`.
+- **tour**: The universe moving itself from the team to each customer
+  account and project, then to each hold, until a key or click ends it.
+  *Not:* onboarding, a walkthrough of the app, or a presentation (that is
+  wallflower's presenter).
+  *Code:* universe `tourStops`, `touring` (`src/client/ui/App.tsx`), key `T`.
+
 ### Bounded contexts
 
 Each repo owns the words for its own job. The shared core above is owned by
@@ -147,6 +166,7 @@ wiki_mcp, which owns tenants.
 | Boards | wallflower | board, card, group, frame, presenter |
 | Shared documents | artifacts-quick | document, link, seal |
 | Activity | activity | change, change log, feed |
+| Universe | universe | universe, tour |
 | Lab: one person's agent | always-on-agent | channel, schedule, to-do, workspace folder, memory |
 | Lab: interactive apps | Cloudflare OS | workspace, gadget, blueprint |
 | CI and look | cf-github-runners, gh-ci-templates, presidio-ui | runner, approval, stage, token |
