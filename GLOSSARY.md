@@ -109,6 +109,29 @@ These are the Trifecta's names for what agents meet through it.
   *Code:* the `guides` tool in wiki_mcp and Muster;
   `skill://wiki/<name>/SKILL.md`.
 
+### Decision models
+
+- **decision model**: An AI model that answers typed questions about some
+  text with a probability for each allowed answer, and writes no text. Jev
+  (TypeSafe) is one, reached through the AI Gateway that holds its key.
+  *Not:* a language model, a rule, or a person's approval.
+  *Code:* wiki_mcp `src/judgment/jev.ts` (`askJev`, `JEV_VERSION`), mirrored
+  in Muster `packages/judgment`; always-on-agent `src/agent/jev.ts`;
+  microsite-kit `control/src/policy.ts`; Cloudflare OS
+  `DecisionModelBinding`.
+- **judgment**: One named question a service asks a decision model, with the
+  threshold it acts at and what happens when there is no answer. A judgment
+  may warn, rank, sort or make a rule stricter; it never opens a gate, sets a
+  status or replaces a person's approval. Each answer is one entry in that
+  service's judgment log.
+  *Not:* a decision (the model judges; a person or a rule decides), a
+  finding, a diagnostic, or an approval.
+  *Code:* `JudgmentRecord`; wiki_mcp `src/judgment/note-orders.ts`
+  (`note_gives_orders`) and `src/links/suggest.ts`; Muster
+  `apps/muster/src/judgment/` and `judgment_log`, `apps/feedback/src/sort.ts`
+  (`sort_feedback`). always-on-agent calls these "Jev checks", microsite-kit
+  "findings".
+
 ### Bounded contexts
 
 Each repo owns the words for its own job. The shared core above is owned by
