@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const GLOSSARY_CORE_SHA256 = "0178df9256d493aa9704c596ea8caa6b3fa22efd08bace4aebe0911bbd97cb25";
+const GLOSSARY_CORE_SHA256 = "d6ecfd2144c154e70e9f3182a3926995daf180770e6a9bc3acc231c05f3a9562";
 const START = "<!-- glossary-core:start -->";
 const END = "<!-- glossary-core:end -->";
 
